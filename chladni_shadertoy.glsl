@@ -1,5 +1,6 @@
 // Chladni Plate Audio Visualizer
 // Visualizes audio as vibrating plate nodal patterns
+// C and Python versions available at: https://github.com/duffey/chladni
 
 #define PI 3.14159265
 
