@@ -1,11 +1,15 @@
 /*
- * Audio Reactive Chladni Plate Visualizer - Win32 C Port
+ * Spectral Shell Visualizer - Constant-Q Standing Wave Synthesis
+ * Win32 C Port
+ *
+ * Standing wave visualizer with mirror symmetry about x and y axes.
+ * Uses even-even cosine modes: cos(kx*x) * cos(ky*y)
  *
  * Build with:
- *   cl /O2 chladni.c /link opengl32.lib user32.lib gdi32.lib ole32.lib
+ *   cl /O2 shells.c /link opengl32.lib user32.lib gdi32.lib ole32.lib
  *
  * Or with MinGW:
- *   gcc -O2 chladni.c -o chladni.exe -lopengl32 -lgdi32 -lole32 -lm
+ *   gcc -O2 shells.c -o shells.exe -lopengl32 -lgdi32 -lole32 -lm
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -50,9 +54,12 @@ DEFINE_GUID(IID_IAudioCaptureClient,  0xc8adbd64, 0xe71e, 0x48a0,
 #define GL_COMPILE_STATUS                 0x8B81
 #define GL_LINK_STATUS                    0x8B82
 #define GL_INFO_LOG_LENGTH                0x8B84
-#define GL_TEXTURE_BUFFER                 0x8C2A
-#define GL_R32F                           0x822E
 #define GL_TEXTURE0                       0x84C0
+#define GL_TEXTURE1                       0x84C1
+#define GL_TEXTURE_1D                     0x0DE0
+#define GL_R32F                           0x822E
+#define GL_RGBA32F                        0x8814
+#define GL_CLAMP_TO_EDGE                  0x812F
 
 typedef char GLchar;
 typedef ptrdiff_t GLsizeiptr;
@@ -83,7 +90,6 @@ typedef void (APIENTRY *PFNGLBUFFERSUBDATAPROC)(GLenum target, GLintptr offset, 
 typedef void (APIENTRY *PFNGLVERTEXATTRIBPOINTERPROC)(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer);
 typedef void (APIENTRY *PFNGLENABLEVERTEXATTRIBARRAYPROC)(GLuint index);
 typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
-typedef void (APIENTRY *PFNGLTEXBUFFERPROC)(GLenum target, GLenum internalformat, GLuint buffer);
 typedef BOOL (APIENTRY *PFNWGLSWAPINTERVALEXTPROC)(int interval);
 typedef HGLRC (APIENTRY *PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC hDC, HGLRC hShareContext, const int *attribList);
 
@@ -117,7 +123,6 @@ static PFNGLBUFFERSUBDATAPROC glBufferSubData;
 static PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer;
 static PFNGLENABLEVERTEXATTRIBARRAYPROC glEnableVertexAttribArray;
 static PFNGLACTIVETEXTUREPROC glActiveTexture;
-static PFNGLTEXBUFFERPROC glTexBuffer;
 static PFNWGLSWAPINTERVALEXTPROC wglSwapIntervalEXT;
 static PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB;
 
@@ -147,7 +152,6 @@ static void LoadGLExtensions(void) {
     glVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC)wglGetProcAddress("glVertexAttribPointer");
     glEnableVertexAttribArray = (PFNGLENABLEVERTEXATTRIBARRAYPROC)wglGetProcAddress("glEnableVertexAttribArray");
     glActiveTexture = (PFNGLACTIVETEXTUREPROC)wglGetProcAddress("glActiveTexture");
-    glTexBuffer = (PFNGLTEXBUFFERPROC)wglGetProcAddress("glTexBuffer");
     wglSwapIntervalEXT = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
     wglCreateContextAttribsARB = (PFNWGLCREATECONTEXTATTRIBSARBPROC)wglGetProcAddress("wglCreateContextAttribsARB");
 }
@@ -161,6 +165,9 @@ static void LoadGLExtensions(void) {
 #define MAX_FFT_SIZE    32768
 #define MAX_BINS        (MAX_FFT_SIZE / 2 + 1)
 #define PI              3.14159265358979323846f
+
+#define MAX_MODES       2048
+#define MAX_SHELLS      64
 
 /* ============================================================================
  * Shaders
@@ -182,17 +189,15 @@ static const char *FRAGMENT_SHADER_SRC =
     "out vec4 outColor;\n"
     "\n"
     "uniform vec2 iResolution;\n"
-    "uniform samplerBuffer iSpectrum;\n"
-    "uniform int iNumBins;\n"
-    "uniform float iFreqPerBin;\n"
-    "uniform float iMaxFreq;\n"
-    "uniform float iBaseFreq;\n"
-    "uniform float iModeScale;\n"
-    "uniform float iContrast;\n"
-    "uniform int iColorMode;\n"
+    "uniform sampler1D iShellAmps;\n"
+    "uniform sampler1D iModeData;\n"
+    "uniform int iNumModes;\n"
+    "uniform int iNumShells;\n"
     "uniform float iTime;\n"
-    "uniform int iBoundary;\n"
-    "uniform int iAspectMode;\n"
+    "uniform int iColorMode;\n"
+    "uniform float iContrast;\n"
+    "uniform float iScale;\n"
+    "uniform int iModeType;\n"
     "\n"
     "#define PI 3.14159265\n"
     "#define TAU 6.28318530\n"
@@ -209,6 +214,7 @@ static const char *FRAGMENT_SHADER_SRC =
     "    vec3 c3 = vec3(0.881443, 0.392529, 0.383229);\n"
     "    vec3 c4 = vec3(0.987622, 0.645320, 0.039886);\n"
     "    vec3 c5 = vec3(0.940015, 0.975158, 0.131326);\n"
+    "    if (t >= 1.0) return c5;\n"
     "    float s = t * 5.0;\n"
     "    int idx = int(floor(s));\n"
     "    float f = fract(s);\n"
@@ -227,6 +233,7 @@ static const char *FRAGMENT_SHADER_SRC =
     "    vec3 c3 = vec3(0.974417, 0.462840, 0.359756);\n"
     "    vec3 c4 = vec3(0.995131, 0.766837, 0.534094);\n"
     "    vec3 c5 = vec3(0.987053, 0.991438, 0.749504);\n"
+    "    if (t >= 1.0) return c5;\n"
     "    float s = t * 5.0;\n"
     "    int idx = int(floor(s));\n"
     "    float f = fract(s);\n"
@@ -247,6 +254,7 @@ static const char *FRAGMENT_SHADER_SRC =
     "    vec3 c5 = vec3(0.88092, 0.73551, 0.07741);\n"
     "    vec3 c6 = vec3(0.97131, 0.45935, 0.05765);\n"
     "    vec3 c7 = vec3(0.84299, 0.15070, 0.15090);\n"
+    "    if (t >= 1.0) return c7;\n"
     "    float s = t * 7.0;\n"
     "    int idx = int(floor(s));\n"
     "    float f = fract(s);\n"
@@ -272,6 +280,7 @@ static const char *FRAGMENT_SHADER_SRC =
     "    vec3 c8 = vec3(0.525776, 0.833491, 0.288127);\n"
     "    vec3 c9 = vec3(0.762373, 0.876424, 0.137064);\n"
     "    vec3 c10 = vec3(0.993248, 0.906157, 0.143936);\n"
+    "    if (t >= 1.0) return c10;\n"
     "    float s = t * 10.0;\n"
     "    int idx = int(floor(s));\n"
     "    float f = fract(s);\n"
@@ -287,217 +296,79 @@ static const char *FRAGMENT_SHADER_SRC =
     "    return mix(c9, c10, f);\n"
     "}\n"
     "\n"
-    "vec3 diverging(float t) {\n"
-    "    t = clamp(t, -1.0, 1.0);\n"
-    "    vec3 cold = vec3(0.085, 0.180, 0.525);\n"
-    "    vec3 cool = vec3(0.350, 0.550, 0.850);\n"
-    "    vec3 neutral = vec3(0.970, 0.970, 0.970);\n"
-    "    vec3 warm = vec3(0.900, 0.450, 0.350);\n"
-    "    vec3 hot = vec3(0.600, 0.050, 0.100);\n"
-    "    if (t < -0.5) return mix(cold, cool, (t + 1.0) * 2.0);\n"
-    "    if (t < 0.0) return mix(cool, neutral, (t + 0.5) * 2.0);\n"
-    "    if (t < 0.5) return mix(neutral, warm, t * 2.0);\n"
-    "    return mix(warm, hot, (t - 0.5) * 2.0);\n"
-    "}\n"
-    "\n"
-    "// ============================================================================\n"
-    "// PLATE EIGENMODES\n"
-    "// ============================================================================\n"
-    "\n"
-    "float beamCC(float x, float n) {\n"
-    "    float k = (n + 0.5) * PI;\n"
-    "    float s = sin(k * x);\n"
-    "    float edge = 1.0 - exp(-3.0 * min(x + 1.0, 1.0 - x));\n"
-    "    return s * edge;\n"
-    "}\n"
-    "\n"
-    "float beamFF(float x, float n) {\n"
-    "    return cos(n * PI * x);\n"
-    "}\n"
-    "\n"
-    "float beamCF(float x, float n) {\n"
-    "    float k = (n + 0.25) * PI;\n"
-    "    float xNorm = (x + 1.0) * 0.5;\n"
-    "    return sin(k * xNorm) - sinh(k * xNorm) * exp(-k);\n"
-    "}\n"
-    "\n"
-    "float modeSimplySupported(vec2 p, float n, float m, float aspect) {\n"
-    "    float qx = (p.x / aspect + 1.0) * 0.5;\n"
-    "    float qy = (p.y + 1.0) * 0.5;\n"
-    "    return sin(n * PI * qx) * sin(m * PI * qy);\n"
-    "}\n"
-    "\n"
-    "float modeClamped(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    return beamCC(px, n) * beamCC(p.y, m);\n"
-    "}\n"
-    "\n"
-    "float modeFree(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    float xMode = (n < 0.5) ? 1.0 : beamFF(px, n);\n"
-    "    float yMode = (m < 0.5) ? 1.0 : beamFF(p.y, m);\n"
-    "    return xMode * yMode;\n"
-    "}\n"
-    "\n"
-    "float modeSSF(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    float qx = (px + 1.0) * 0.5;\n"
-    "    float xMode = sin(n * PI * qx);\n"
-    "    float yMode = (m < 0.5) ? 1.0 : cos(m * PI * p.y);\n"
-    "    return xMode * yMode;\n"
-    "}\n"
-    "\n"
-    "float modeCSS(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    float qy = (p.y + 1.0) * 0.5;\n"
-    "    return beamCC(px, n) * sin(m * PI * qy);\n"
-    "}\n"
-    "\n"
-    "float modeCF(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    float xMode = beamCC(px, n);\n"
-    "    float yMode = (m < 0.5) ? 1.0 : beamFF(p.y, m);\n"
-    "    return xMode * yMode;\n"
-    "}\n"
-    "\n"
-    "float modeCantilever(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    float xMode = beamCF(px, n);\n"
-    "    float yMode = (m < 0.5) ? 1.0 : beamFF(p.y, m);\n"
-    "    return xMode * yMode;\n"
-    "}\n"
-    "\n"
-    "float modeGuided(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    return cos(n * PI * px) * cos(m * PI * p.y);\n"
-    "}\n"
-    "\n"
-    "float modeChladni(vec2 p, float n, float m, float aspect) {\n"
-    "    float px = p.x / aspect;\n"
-    "    float py = p.y;\n"
-    "    float mode_nm = cos(n * PI * px) * cos(m * PI * py);\n"
-    "    float mode_mn = cos(m * PI * px) * cos(n * PI * py);\n"
-    "    return mode_nm - mode_mn;\n"
-    "}\n"
-    "\n"
-    "float computeSingleMode(vec2 p, float n, float m, float aspect, int boundary) {\n"
-    "    vec2 pc = p;\n"
-    "    if (boundary == 1 || boundary == 4 || boundary == 5 || boundary == 6) {\n"
-    "        pc.x = clamp(p.x, -aspect, aspect);\n"
-    "        pc.y = clamp(p.y, -1.0, 1.0);\n"
-    "    }\n"
-    "    if (boundary == 0) return modeSimplySupported(p, n, m, aspect);\n"
-    "    else if (boundary == 1) return modeClamped(pc, n, m, aspect);\n"
-    "    else if (boundary == 2) return modeFree(p, n, m, aspect);\n"
-    "    else if (boundary == 3) return modeSSF(p, n, m, aspect);\n"
-    "    else if (boundary == 4) return modeCSS(pc, n, m, aspect);\n"
-    "    else if (boundary == 5) return modeCF(pc, n, m, aspect);\n"
-    "    else if (boundary == 6) return modeCantilever(pc, n, m, aspect);\n"
-    "    else return modeGuided(p, n, m, aspect);\n"
-    "}\n"
-    "\n"
-    "float computeModeSum(vec2 p, float targetLambda, float aspect, int boundary, float time) {\n"
-    "    float sqrtL = sqrt(max(5.0, targetLambda));\n"
-    "    float n = max(2.0, floor(sqrtL * 0.9 + 0.5));\n"
-    "    float m = max(1.0, floor(sqrtL * 0.5 + 0.5));\n"
-    "    if (n <= m) n = m + 1.0;\n"
-    "    if (boundary == 0) return modeChladni(p, n, m, aspect);\n"
-    "    else return computeSingleMode(p, n, m, aspect, boundary);\n"
-    "}\n"
-    "\n"
     "// ============================================================================\n"
     "// MAIN\n"
     "// ============================================================================\n"
     "\n"
     "void main() {\n"
     "    vec2 uv = fragCoord / iResolution;\n"
-    "    float windowAspect = iResolution.x / iResolution.y;\n"
+    "    float aspect = iResolution.x / iResolution.y;\n"
     "\n"
+    "    // Normalized coordinates centered at origin, scaled\n"
     "    vec2 p;\n"
-    "    bool outOfBounds = false;\n"
-    "    float plateAspect = 1.0;\n"
+    "    p.x = (uv.x - 0.5) * 2.0 * aspect * iScale;\n"
+    "    p.y = (uv.y - 0.5) * 2.0 * iScale;\n"
     "\n"
-    "    if (iAspectMode == 0) {\n"
-    "        plateAspect = windowAspect;\n"
-    "        p.x = (uv.x - 0.5) * 2.0 * windowAspect;\n"
-    "        p.y = (uv.y - 0.5) * 2.0;\n"
-    "    } else if (iAspectMode == 1) {\n"
-    "        plateAspect = 1.0;\n"
-    "        if (windowAspect > 1.0) {\n"
-    "            float plateWidth = 1.0 / windowAspect;\n"
-    "            float margin = (1.0 - plateWidth) / 2.0;\n"
-    "            if (uv.x < margin || uv.x > 1.0 - margin) {\n"
-    "                outOfBounds = true;\n"
-    "            } else {\n"
-    "                float localX = (uv.x - margin) / plateWidth;\n"
-    "                p.x = (localX - 0.5) * 2.0;\n"
-    "                p.y = (uv.y - 0.5) * 2.0;\n"
-    "            }\n"
+    "    // Field synthesis: u(x,y,t) = Σ A_s / N_s * cos(kx*x) * cos(ky*y)\n"
+    "    float u = 0.0;\n"
+    "\n"
+    "    for (int i = 0; i < 2048; i++) {\n"
+    "        if (i >= iNumModes) break;\n"
+    "\n"
+    "        // Fetch mode data: (kx, ky, shell, inv_count)\n"
+    "        float texCoord = (float(i) + 0.5) / float(iNumModes);\n"
+    "        vec4 mode = texture(iModeData, texCoord);\n"
+    "\n"
+    "        float kx = mode.r;\n"
+    "        float ky = mode.g;\n"
+    "        int shell = int(mode.b);\n"
+    "        float inv_count = mode.a;\n"
+    "\n"
+    "        // Get shell amplitude\n"
+    "        float shellCoord = (float(shell) + 0.5) / float(iNumShells);\n"
+    "        float A_s = texture(iShellAmps, shellCoord).r;\n"
+    "\n"
+    "        // Standing wave with x and y mirror symmetry\n"
+    "        float mode_val;\n"
+    "\n"
+    "        if (iModeType == 0) {\n"
+    "            // All modes: cos(kx*x) * cos(ky*y)\n"
+    "            mode_val = cos(kx * p.x) * cos(ky * p.y);\n"
+    "        } else if (iModeType == 1) {\n"
+    "            // Only m != n modes (skip when kx == ky)\n"
+    "            if (abs(kx - ky) < 0.01) continue;\n"
+    "            mode_val = cos(kx * p.x) * cos(ky * p.y);\n"
     "        } else {\n"
-    "            float plateHeight = windowAspect;\n"
-    "            float margin = (1.0 - plateHeight) / 2.0;\n"
-    "            if (uv.y < margin || uv.y > 1.0 - margin) {\n"
-    "                outOfBounds = true;\n"
-    "            } else {\n"
-    "                float localY = (uv.y - margin) / plateHeight;\n"
-    "                p.x = (uv.x - 0.5) * 2.0;\n"
-    "                p.y = (localY - 0.5) * 2.0;\n"
-    "            }\n"
+    "            // Diagonal symmetry: cos(kx*x)*cos(ky*y) + cos(ky*x)*cos(kx*y)\n"
+    "            mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);\n"
+    "            if (abs(kx - ky) < 0.01) mode_val *= 0.5;\n"
     "        }\n"
-    "    } else {\n"
-    "        plateAspect = 1.0;\n"
-    "        if (windowAspect > 1.0) {\n"
-    "            p.x = (uv.x - 0.5) * 2.0 * windowAspect;\n"
-    "            p.y = (uv.y - 0.5) * 2.0;\n"
-    "        } else {\n"
-    "            p.x = (uv.x - 0.5) * 2.0;\n"
-    "            p.y = (uv.y - 0.5) * 2.0 / windowAspect;\n"
-    "        }\n"
+    "\n"
+    "        u += A_s * inv_count * mode_val;\n"
     "    }\n"
     "\n"
-    "    if (outOfBounds) {\n"
-    "        outColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
-    "        return;\n"
-    "    }\n"
+    "    // Energy rendering: I = u^2\n"
+    "    float I = u * u;\n"
     "\n"
-    "    float displacement = 0.0;\n"
-    "    float totalEnergy = 0.0;\n"
-    "    int maxBin = min(iNumBins, int(iMaxFreq / iFreqPerBin));\n"
+    "    // Apply contrast\n"
+    "    I = pow(I, 1.0 / iContrast);\n"
     "\n"
-    "    for (int i = 1; i < 2048; i++) {\n"
-    "        if (i >= maxBin) break;\n"
-    "        float freq = float(i) * iFreqPerBin;\n"
-    "        float amp = texelFetch(iSpectrum, i).r;\n"
-    "        if (amp < 0.005) continue;\n"
-    "        float ratio = freq / iBaseFreq;\n"
-    "        float targetLambda = 5.0 + ratio * iModeScale * 10.0;\n"
-    "        float mode = computeModeSum(p, targetLambda, plateAspect, iBoundary, iTime);\n"
-    "        displacement += amp * mode;\n"
-    "        totalEnergy += amp;\n"
-    "    }\n"
+    "    // Soft clamp\n"
+    "    I = tanh(I * 2.0);\n"
     "\n"
-    "    if (totalEnergy > 0.1) {\n"
-    "        displacement /= sqrt(totalEnergy);\n"
-    "    }\n"
-    "\n"
-    "    float d = displacement * iContrast;\n"
+    "    // Color mapping\n"
     "    vec3 color;\n"
-    "\n"
     "    if (iColorMode == 0) {\n"
-    "        float energy = tanh(abs(d));\n"
-    "        color = plasma(energy);\n"
+    "        color = plasma(I);\n"
     "    } else if (iColorMode == 1) {\n"
-    "        float energy = tanh(abs(d));\n"
-    "        color = magma(energy);\n"
+    "        color = magma(I);\n"
     "    } else if (iColorMode == 2) {\n"
-    "        float energy = tanh(abs(d));\n"
-    "        color = turbo(energy);\n"
+    "        color = turbo(I);\n"
     "    } else if (iColorMode == 3) {\n"
-    "        float energy = tanh(abs(d));\n"
-    "        color = viridis(energy);\n"
+    "        color = viridis(I);\n"
     "    } else {\n"
-    "        float signed_d = tanh(d);\n"
-    "        color = diverging(signed_d);\n"
+    "        // Grayscale\n"
+    "        color = vec3(I);\n"
     "    }\n"
     "\n"
     "    outColor = vec4(color, 1.0);\n"
@@ -532,7 +403,6 @@ static AudioCapture g_audio;
 
 /* Simple radix-2 FFT - Cooley-Tukey algorithm */
 static void fft_complex(float *real, float *imag, int n) {
-    /* Bit-reversal permutation */
     int i, j, k;
     for (i = 1, j = 0; i < n; i++) {
         int bit = n >> 1;
@@ -546,7 +416,6 @@ static void fft_complex(float *real, float *imag, int n) {
         }
     }
 
-    /* Cooley-Tukey iterative FFT */
     for (int len = 2; len <= n; len <<= 1) {
         float angle = -2.0f * PI / len;
         float wpr = cosf(angle);
@@ -571,7 +440,6 @@ static void fft_complex(float *real, float *imag, int n) {
 }
 
 static void AudioUpdateFFTParams(AudioCapture *a) {
-    int nBins = a->fftSize / 2 + 1;
     for (int i = 0; i < a->fftSize; i++) {
         a->window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (a->fftSize - 1)));
     }
@@ -588,10 +456,8 @@ static DWORD WINAPI AudioCaptureThread(LPVOID param) {
 
     __try {
         while (a->running) {
-            /* When paused, just sleep and discard audio data */
             if (a->paused) {
                 Sleep(50);
-                /* Drain buffer to prevent buildup */
                 if (a->pCaptureClient) {
                     UINT32 packetLength = 0;
                     hr = IAudioCaptureClient_GetNextPacketSize(a->pCaptureClient, &packetLength);
@@ -611,7 +477,6 @@ static DWORD WINAPI AudioCaptureThread(LPVOID param) {
 
             if (!a->pCaptureClient) break;
 
-            /* Polling mode - check for available data */
             UINT32 packetLength = 0;
             hr = IAudioCaptureClient_GetNextPacketSize(a->pCaptureClient, &packetLength);
 
@@ -647,7 +512,6 @@ static DWORD WINAPI AudioCaptureThread(LPVOID param) {
                     hr = IAudioCaptureClient_GetNextPacketSize(a->pCaptureClient, &packetLength);
                 }
             } else {
-                /* No data available, sleep briefly */
                 Sleep(1);
             }
         }
@@ -704,7 +568,6 @@ static BOOL AudioInit(AudioCapture *a, int fftSize) {
         return FALSE;
     }
 
-    /* Use polling mode instead of event-driven (more stable with focus changes) */
     hr = IAudioClient_Initialize(a->pAudioClient, AUDCLNT_SHAREMODE_SHARED,
                                   AUDCLNT_STREAMFLAGS_LOOPBACK,
                                   10000000, 0, a->pwfx, NULL);
@@ -815,58 +678,161 @@ static float *AudioGetData(AudioCapture *a) {
 }
 
 /* ============================================================================
+ * Shell Processor - Constant-Q mode mapping
+ * ============================================================================ */
+
+typedef struct {
+    int numModes;
+    int numShells;
+    float kappa;
+    float tauAttack;
+    float tauRelease;
+
+    float modeData[MAX_MODES * 4];  /* (kx, ky, shell, inv_count) */
+    int shellCounts[MAX_SHELLS];
+    float shellAmps[MAX_SHELLS];
+
+    LARGE_INTEGER lastTime;
+    LARGE_INTEGER freq;
+} ShellProcessor;
+
+static ShellProcessor g_shell;
+
+static int BinToShell(int binIdx, int nBins, float freqPerBin) {
+    float freq = binIdx * freqPerBin;
+    if (freq < 20.0f) return -1;
+
+    float baseFreq = 40.0f;
+    float r = freq / baseFreq;
+    if (r < 1.0f) return -1;
+
+    int s = (int)floorf(4.0f * log2f(r));
+    return (s < MAX_SHELLS) ? s : MAX_SHELLS - 1;
+}
+
+static void ShellInit(ShellProcessor *sp) {
+    memset(sp, 0, sizeof(*sp));
+    sp->numShells = MAX_SHELLS;
+    sp->kappa = 5.0f;
+    sp->tauAttack = 0.040f;
+    sp->tauRelease = 0.300f;
+
+    QueryPerformanceFrequency(&sp->freq);
+    QueryPerformanceCounter(&sp->lastTime);
+
+    /* Generate modes */
+    int modeIdx = 0;
+    int maxMN = 32;
+
+    for (int m = 0; m <= maxMN; m++) {
+        for (int n = 0; n <= maxMN; n++) {
+            if (m == 0 && n == 0) continue;  /* Skip DC */
+            if (modeIdx >= MAX_MODES) break;
+
+            float r = sqrtf((float)(m*m + n*n));
+            int s = (int)floorf(4.0f * log2f(r));
+            if (s < 0 || s >= MAX_SHELLS) continue;
+
+            float kx = m * PI;
+            float ky = n * PI;
+
+            sp->modeData[modeIdx * 4 + 0] = kx;
+            sp->modeData[modeIdx * 4 + 1] = ky;
+            sp->modeData[modeIdx * 4 + 2] = (float)s;
+            sp->modeData[modeIdx * 4 + 3] = 0.0f;  /* Will set inv_count later */
+            sp->shellCounts[s]++;
+            modeIdx++;
+        }
+        if (modeIdx >= MAX_MODES) break;
+    }
+    sp->numModes = modeIdx;
+
+    /* Set inverse counts */
+    for (int i = 0; i < sp->numModes; i++) {
+        int s = (int)sp->modeData[i * 4 + 2];
+        float invCount = 1.0f / (float)(sp->shellCounts[s] > 0 ? sp->shellCounts[s] : 1);
+        sp->modeData[i * 4 + 3] = invCount;
+    }
+
+    int activeShells = 0;
+    for (int i = 0; i < MAX_SHELLS; i++) {
+        if (sp->shellCounts[i] > 0) activeShells++;
+    }
+
+    printf("Initialized %d modes across %d active shells\n", sp->numModes, activeShells);
+}
+
+static void ShellProcess(ShellProcessor *sp, float *spectrum, int nBins, int fftSize) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    float dt = (float)(now.QuadPart - sp->lastTime.QuadPart) / (float)sp->freq.QuadPart;
+    sp->lastTime = now;
+
+    float freqPerBin = (float)SAMPLE_RATE / fftSize;
+
+    /* Compute raw shell energies */
+    float shellEnergyRaw[MAX_SHELLS] = {0};
+    for (int i = 1; i < nBins; i++) {
+        int s = BinToShell(i, nBins, freqPerBin);
+        if (s >= 0 && s < MAX_SHELLS) {
+            shellEnergyRaw[s] += spectrum[i] * spectrum[i];
+        }
+    }
+
+    /* Log compression and attack/release smoothing */
+    float alphaAttack = 1.0f - expf(-dt / sp->tauAttack);
+    float alphaRelease = 1.0f - expf(-dt / sp->tauRelease);
+
+    for (int s = 0; s < MAX_SHELLS; s++) {
+        float E_s = logf(1.0f + sp->kappa * shellEnergyRaw[s]);
+
+        if (E_s > sp->shellAmps[s]) {
+            sp->shellAmps[s] += alphaAttack * (E_s - sp->shellAmps[s]);
+        } else {
+            sp->shellAmps[s] += alphaRelease * (E_s - sp->shellAmps[s]);
+        }
+    }
+}
+
+/* ============================================================================
  * Visualizer
  * ============================================================================ */
 
-/* Default values matching Python version */
-#define DEFAULT_BASE_FREQ    40.0f
-#define DEFAULT_MODE_SCALE   0.5f
-#define DEFAULT_MAX_FREQ     7000.0f
-#define DEFAULT_CONTRAST     1.0f
-#define DEFAULT_COLOR_MODE   4
-#define DEFAULT_BOUNDARY     0
-#define DEFAULT_ASPECT_MODE  2
+#define DEFAULT_CONTRAST     1.5f
+#define DEFAULT_SCALE        1.0f
+#define DEFAULT_COLOR_MODE   0
+#define DEFAULT_MODE_TYPE    0
 #define DEFAULT_FFT_SIZE     8192
 
 #define NUM_COLOR_MODES      5
-#define NUM_BOUNDARIES       8
-#define NUM_ASPECT_MODES     3
+#define NUM_MODE_TYPES       3
 
-static const char *COLOR_NAMES[] = {"Plasma", "Magma", "Turbo", "Viridis", "Signed"};
-static const char *BOUNDARY_NAMES[] = {
-    "Chladni", "Clamped", "Free", "SS-Free",
-    "Clamped-SS", "Clamped-Free", "Cantilever", "Guided"
-};
-static const char *ASPECT_NAMES[] = {"Full", "1:1 Letterbox", "1:1 Crop"};
+static const char *COLOR_NAMES[] = {"Plasma", "Magma", "Turbo", "Viridis", "Grayscale"};
+static const char *MODE_TYPE_NAMES[] = {"All", "m!=n", "Diagonal"};
 
 typedef struct {
     int w, h;
-    float baseFreq;
-    float modeScale;
-    float maxFreq;
     float contrast;
+    float scale;
     int colorMode;
-    int boundary;
-    int aspectMode;
+    int modeType;
     float time;
 
     GLuint program;
     GLuint vao;
-    GLuint spectrumTbo;
-    GLuint spectrumTex;
+    GLuint shellTex;
+    GLuint modeTex;
 
     GLint locResolution;
-    GLint locSpectrum;
-    GLint locNumBins;
-    GLint locFreqPerBin;
-    GLint locMaxFreq;
-    GLint locBaseFreq;
-    GLint locModeScale;
-    GLint locContrast;
-    GLint locColorMode;
+    GLint locShellAmps;
+    GLint locModeData;
+    GLint locNumModes;
+    GLint locNumShells;
     GLint locTime;
-    GLint locBoundary;
-    GLint locAspectMode;
+    GLint locColorMode;
+    GLint locContrast;
+    GLint locScale;
+    GLint locModeType;
 } Visualizer;
 
 static Visualizer g_viz;
@@ -879,8 +845,8 @@ static GLuint CompileShader(GLenum type, const char *source) {
     GLint status;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
     if (!status) {
-        char log[512];
-        glGetShaderInfoLog(shader, 512, NULL, log);
+        char log[1024];
+        glGetShaderInfoLog(shader, 1024, NULL, log);
         printf("Shader compile error: %s\n", log);
         return 0;
     }
@@ -888,16 +854,13 @@ static GLuint CompileShader(GLenum type, const char *source) {
 }
 
 static void VizResetDefaults(Visualizer *v) {
-    v->baseFreq = DEFAULT_BASE_FREQ;
-    v->modeScale = DEFAULT_MODE_SCALE;
-    v->maxFreq = DEFAULT_MAX_FREQ;
     v->contrast = DEFAULT_CONTRAST;
+    v->scale = DEFAULT_SCALE;
     v->colorMode = DEFAULT_COLOR_MODE;
-    v->boundary = DEFAULT_BOUNDARY;
-    v->aspectMode = DEFAULT_ASPECT_MODE;
+    v->modeType = DEFAULT_MODE_TYPE;
 }
 
-static BOOL VizInit(Visualizer *v, int w, int h) {
+static BOOL VizInit(Visualizer *v, int w, int h, ShellProcessor *sp) {
     v->w = w;
     v->h = h;
     v->time = 0.0f;
@@ -915,8 +878,8 @@ static BOOL VizInit(Visualizer *v, int w, int h) {
     GLint status;
     glGetProgramiv(v->program, GL_LINK_STATUS, &status);
     if (!status) {
-        char log[512];
-        glGetProgramInfoLog(v->program, 512, NULL, log);
+        char log[1024];
+        glGetProgramInfoLog(v->program, 1024, NULL, log);
         printf("Program link error: %s\n", log);
         return FALSE;
     }
@@ -940,71 +903,75 @@ static BOOL VizInit(Visualizer *v, int w, int h) {
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
     glEnableVertexAttribArray(0);
 
-    glGenBuffers(1, &v->spectrumTbo);
-    glGenTextures(1, &v->spectrumTex);
+    /* 1D texture for shell amplitudes */
+    glGenTextures(1, &v->shellTex);
+    glBindTexture(GL_TEXTURE_1D, v->shellTex);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, MAX_SHELLS, 0, GL_RED, GL_FLOAT, NULL);
 
-    float initialData[MAX_BINS] = {0};
-    glBindBuffer(GL_TEXTURE_BUFFER, v->spectrumTbo);
-    glBufferData(GL_TEXTURE_BUFFER, sizeof(initialData), initialData, GL_DYNAMIC_DRAW);
-
-    glBindTexture(GL_TEXTURE_BUFFER, v->spectrumTex);
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_R32F, v->spectrumTbo);
+    /* 1D texture for mode data */
+    glGenTextures(1, &v->modeTex);
+    glBindTexture(GL_TEXTURE_1D, v->modeTex);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA32F, sp->numModes, 0, GL_RGBA, GL_FLOAT, sp->modeData);
 
     v->locResolution = glGetUniformLocation(v->program, "iResolution");
-    v->locSpectrum = glGetUniformLocation(v->program, "iSpectrum");
-    v->locNumBins = glGetUniformLocation(v->program, "iNumBins");
-    v->locFreqPerBin = glGetUniformLocation(v->program, "iFreqPerBin");
-    v->locMaxFreq = glGetUniformLocation(v->program, "iMaxFreq");
-    v->locBaseFreq = glGetUniformLocation(v->program, "iBaseFreq");
-    v->locModeScale = glGetUniformLocation(v->program, "iModeScale");
-    v->locContrast = glGetUniformLocation(v->program, "iContrast");
-    v->locColorMode = glGetUniformLocation(v->program, "iColorMode");
+    v->locShellAmps = glGetUniformLocation(v->program, "iShellAmps");
+    v->locModeData = glGetUniformLocation(v->program, "iModeData");
+    v->locNumModes = glGetUniformLocation(v->program, "iNumModes");
+    v->locNumShells = glGetUniformLocation(v->program, "iNumShells");
     v->locTime = glGetUniformLocation(v->program, "iTime");
-    v->locBoundary = glGetUniformLocation(v->program, "iBoundary");
-    v->locAspectMode = glGetUniformLocation(v->program, "iAspectMode");
+    v->locColorMode = glGetUniformLocation(v->program, "iColorMode");
+    v->locContrast = glGetUniformLocation(v->program, "iContrast");
+    v->locScale = glGetUniformLocation(v->program, "iScale");
+    v->locModeType = glGetUniformLocation(v->program, "iModeType");
 
     return TRUE;
 }
 
-static void VizRender(Visualizer *v, float *spectrum, int fftSize) {
-    int nBins = fftSize / 2 + 1;
-    float freqPerBin = (float)SAMPLE_RATE / fftSize;
+static void VizRender(Visualizer *v, ShellProcessor *sp, float dt) {
+    v->time += dt;
 
-    /* Update spectrum buffer */
-    glBindBuffer(GL_TEXTURE_BUFFER, v->spectrumTbo);
-    glBufferSubData(GL_TEXTURE_BUFFER, 0, MAX_BINS * sizeof(float), spectrum);
+    /* Update shell amplitudes texture */
+    glBindTexture(GL_TEXTURE_1D, v->shellTex);
+    glTexSubImage1D(GL_TEXTURE_1D, 0, 0, MAX_SHELLS, GL_RED, GL_FLOAT, sp->shellAmps);
 
+    glViewport(0, 0, v->w, v->h);
     glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(v->program);
 
+    glUseProgram(v->program);
     glUniform2f(v->locResolution, (float)v->w, (float)v->h);
-    glUniform1i(v->locNumBins, nBins);
-    glUniform1f(v->locFreqPerBin, freqPerBin);
-    glUniform1f(v->locMaxFreq, v->maxFreq);
-    glUniform1f(v->locBaseFreq, v->baseFreq);
-    glUniform1f(v->locModeScale, v->modeScale);
-    glUniform1f(v->locContrast, v->contrast);
-    glUniform1i(v->locColorMode, v->colorMode);
+    glUniform1i(v->locNumModes, sp->numModes);
+    glUniform1i(v->locNumShells, MAX_SHELLS);
     glUniform1f(v->locTime, v->time);
-    glUniform1i(v->locBoundary, v->boundary);
-    glUniform1i(v->locAspectMode, v->aspectMode);
+    glUniform1i(v->locColorMode, v->colorMode);
+    glUniform1f(v->locContrast, v->contrast);
+    glUniform1f(v->locScale, v->scale);
+    glUniform1i(v->locModeType, v->modeType);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_BUFFER, v->spectrumTex);
-    glUniform1i(v->locSpectrum, 0);
+    glBindTexture(GL_TEXTURE_1D, v->shellTex);
+    glUniform1i(v->locShellAmps, 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_1D, v->modeTex);
+    glUniform1i(v->locModeData, 1);
 
     glBindVertexArray(v->vao);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, NULL);
-
-    v->time += 0.016f;
 }
 
-static void PrintStatus(Visualizer *v, int fftSize) {
+static void PrintStatus(Visualizer *v, ShellProcessor *sp, int fftSize) {
     char status[256];
     snprintf(status, sizeof(status),
-             "Base=%.0fHz  Scale=%.2f  MaxF=%.0fHz  Contrast=%.1f  Color=%s  Boundary=%s  Aspect=%s  FFT=%d",
-             v->baseFreq, v->modeScale, v->maxFreq, v->contrast,
-             COLOR_NAMES[v->colorMode], BOUNDARY_NAMES[v->boundary], ASPECT_NAMES[v->aspectMode], fftSize);
+             "Scale=%.2f  Contrast=%.1f  Kappa=%.1f  Attack=%.0fms  Release=%.0fms  Mode=%s  Color=%s  FFT=%d",
+             v->scale, v->contrast, sp->kappa,
+             sp->tauAttack * 1000.0f, sp->tauRelease * 1000.0f,
+             MODE_TYPE_NAMES[v->modeType], COLOR_NAMES[v->colorMode], fftSize);
     printf("\r%-140s", status);
     fflush(stdout);
 }
@@ -1044,7 +1011,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static void ToggleFullscreen(void) {
     if (g_fullscreen) {
-        /* Go windowed */
         SetWindowLong(g_hwnd, GWL_STYLE, g_windowedStyle);
         SetWindowPos(g_hwnd, NULL, g_windowedRect.left, g_windowedRect.top,
                      g_windowedRect.right - g_windowedRect.left,
@@ -1052,11 +1018,9 @@ static void ToggleFullscreen(void) {
                      SWP_FRAMECHANGED | SWP_NOZORDER);
         g_fullscreen = FALSE;
     } else {
-        /* Save windowed state */
         g_windowedStyle = GetWindowLong(g_hwnd, GWL_STYLE);
         GetWindowRect(g_hwnd, &g_windowedRect);
 
-        /* Go borderless fullscreen */
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfo(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
         SetWindowLong(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
@@ -1074,11 +1038,10 @@ static BOOL CreateOpenGLContext(int w, int h) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = "ChladniClass";
+    wc.lpszClassName = "ShellsClass";
     RegisterClass(&wc);
 
-    /* Create temporary window for extension loading */
-    HWND tempHwnd = CreateWindow("ChladniClass", "temp", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, NULL);
+    HWND tempHwnd = CreateWindow("ShellsClass", "temp", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, NULL);
     HDC tempDC = GetDC(tempHwnd);
 
     PIXELFORMATDESCRIPTOR pfd = {
@@ -1101,7 +1064,6 @@ static BOOL CreateOpenGLContext(int w, int h) {
     ReleaseDC(tempHwnd, tempDC);
     DestroyWindow(tempHwnd);
 
-    /* Create real window */
     RECT rect = { 0, 0, w, h };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
@@ -1110,7 +1072,7 @@ static BOOL CreateOpenGLContext(int w, int h) {
     int winW = rect.right - rect.left;
     int winH = rect.bottom - rect.top;
 
-    g_hwnd = CreateWindow("ChladniClass", "Chladni", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_hwnd = CreateWindow("ShellsClass", "Spectral Shell Visualizer", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                           (screenW - winW) / 2, (screenH - winH) / 2, winW, winH,
                           NULL, NULL, wc.hInstance, NULL);
     if (!g_hwnd) return FALSE;
@@ -1119,7 +1081,6 @@ static BOOL CreateOpenGLContext(int w, int h) {
     pf = ChoosePixelFormat(g_hdc, &pfd);
     SetPixelFormat(g_hdc, pf, &pfd);
 
-    /* Create OpenGL 3.3 core context */
     if (wglCreateContextAttribsARB) {
         int attribs[] = {
             WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
@@ -1135,7 +1096,6 @@ static BOOL CreateOpenGLContext(int w, int h) {
     if (!g_hglrc) return FALSE;
     wglMakeCurrent(g_hdc, g_hglrc);
 
-    /* Enable vsync */
     if (wglSwapIntervalEXT) {
         wglSwapIntervalEXT(1);
     }
@@ -1154,9 +1114,7 @@ static void DestroyOpenGLContext(void) {
  * Main
  * ============================================================================ */
 
-
 int main(int argc, char *argv[]) {
-    /* Initialize COM on main thread as STA (required for WASAPI callbacks) */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     int winW = 1280, winH = 720;
@@ -1166,7 +1124,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (!VizInit(&g_viz, winW, winH)) {
+    ShellInit(&g_shell);
+
+    if (!VizInit(&g_viz, winW, winH, &g_shell)) {
         printf("Failed to initialize visualizer\n");
         DestroyOpenGLContext();
         return 1;
@@ -1180,17 +1140,21 @@ int main(int argc, char *argv[]) {
 
     Sleep(50);
 
-    printf("Wave Plate Visualizer - Steady-state plate vibration from audio FFT\n");
-    printf("Controls: UP/DOWN=base freq  W/S=scale  A/D=max freq  Z/X=contrast  LEFT/RIGHT=FFT size  V=color  P=boundary  R=aspect  ALT+ENTER=fullscreen  SPACE=reset  ESC=quit\n\n");
+    printf("Spectral Shell Visualizer - Constant-Q Standing Wave Synthesis\n");
+    printf("Controls: W/S=scale  Z/X=contrast  K/L=kappa  UP/DOWN=attack  LEFT/RIGHT=release\n");
+    printf("          M=mode type  V=color  F=FFT size  ALT+ENTER=fullscreen  SPACE=reset  ESC=quit\n\n");
 
-    PrintStatus(&g_viz, g_audio.fftSize);
+    PrintStatus(&g_viz, &g_shell, g_audio.fftSize);
 
     BOOL running = TRUE;
     DWORD lastKeyTime = 0;
     DWORD repeatDelay = 100;
-    BOOL prevLeft = FALSE, prevRight = FALSE;
-    BOOL prevV = FALSE, prevP = FALSE, prevR = FALSE, prevSpace = FALSE;
+    BOOL prevF = FALSE, prevM = FALSE, prevV = FALSE, prevSpace = FALSE;
     BOOL prevAltEnter = FALSE;
+
+    LARGE_INTEGER perfFreq, lastTime, nowTime;
+    QueryPerformanceFrequency(&perfFreq);
+    QueryPerformanceCounter(&lastTime);
 
     while (running) {
         MSG msg;
@@ -1203,14 +1167,16 @@ int main(int argc, char *argv[]) {
         }
         if (!running) break;
 
+        QueryPerformanceCounter(&nowTime);
+        float dt = (float)(nowTime.QuadPart - lastTime.QuadPart) / (float)perfFreq.QuadPart;
+        lastTime = nowTime;
+
         DWORD now = GetTickCount();
         BOOL needUpdate = FALSE;
 
-        /* Only process keyboard input when window is focused */
         BOOL hasFocus = (GetForegroundWindow() == g_hwnd);
 
         if (hasFocus) {
-            /* ESC to quit */
             if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
                 printf("\nESC pressed - exiting\n");
                 fflush(stdout);
@@ -1218,7 +1184,6 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            /* Alt+Enter for fullscreen */
             BOOL altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             BOOL enterPressed = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
             BOOL currAltEnter = altHeld && enterPressed;
@@ -1227,49 +1192,21 @@ int main(int argc, char *argv[]) {
             }
             prevAltEnter = currAltEnter;
 
-            /* Base frequency */
-            if ((GetAsyncKeyState(VK_UP) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.baseFreq += 5.0f;
-                if (g_viz.baseFreq > 500.0f) g_viz.baseFreq = 500.0f;
-                needUpdate = TRUE;
-                lastKeyTime = now;
-            }
-            if ((GetAsyncKeyState(VK_DOWN) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.baseFreq -= 5.0f;
-                if (g_viz.baseFreq < 10.0f) g_viz.baseFreq = 10.0f;
-                needUpdate = TRUE;
-                lastKeyTime = now;
-            }
-
-            /* Mode scale */
+            /* Scale W/S */
             if ((GetAsyncKeyState('W') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.modeScale += 0.05f;
-                if (g_viz.modeScale > 2.0f) g_viz.modeScale = 2.0f;
+                g_viz.scale *= 1.1f;
+                if (g_viz.scale > 10.0f) g_viz.scale = 10.0f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
             if ((GetAsyncKeyState('S') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.modeScale -= 0.05f;
-                if (g_viz.modeScale < 0.1f) g_viz.modeScale = 0.1f;
+                g_viz.scale /= 1.1f;
+                if (g_viz.scale < 0.1f) g_viz.scale = 0.1f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
 
-            /* Max frequency */
-            if ((GetAsyncKeyState('D') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.maxFreq += 500.0f;
-                if (g_viz.maxFreq > 20000.0f) g_viz.maxFreq = 20000.0f;
-                needUpdate = TRUE;
-                lastKeyTime = now;
-            }
-            if ((GetAsyncKeyState('A') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.maxFreq -= 500.0f;
-                if (g_viz.maxFreq < 500.0f) g_viz.maxFreq = 500.0f;
-                needUpdate = TRUE;
-                lastKeyTime = now;
-            }
-
-            /* Contrast */
+            /* Contrast Z/X */
             if ((GetAsyncKeyState('X') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
                 g_viz.contrast += 0.1f;
                 if (g_viz.contrast > 5.0f) g_viz.contrast = 5.0f;
@@ -1283,21 +1220,67 @@ int main(int argc, char *argv[]) {
                 lastKeyTime = now;
             }
 
-            /* FFT size (edge-triggered) */
-            BOOL currRight = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
-            BOOL currLeft = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
-            if (currRight && !prevRight) {
-                AudioSetFFTSize(&g_audio, g_audio.fftSize * 2);
+            /* Kappa K/L */
+            if ((GetAsyncKeyState('L') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
+                g_shell.kappa *= 1.2f;
+                if (g_shell.kappa > 50.0f) g_shell.kappa = 50.0f;
                 needUpdate = TRUE;
+                lastKeyTime = now;
             }
-            if (currLeft && !prevLeft) {
-                AudioSetFFTSize(&g_audio, g_audio.fftSize / 2);
+            if ((GetAsyncKeyState('K') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
+                g_shell.kappa /= 1.2f;
+                if (g_shell.kappa < 0.1f) g_shell.kappa = 0.1f;
                 needUpdate = TRUE;
+                lastKeyTime = now;
             }
-            prevRight = currRight;
-            prevLeft = currLeft;
 
-            /* Color mode toggle (edge-triggered) */
+            /* Attack UP/DOWN */
+            if ((GetAsyncKeyState(VK_UP) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
+                g_shell.tauAttack *= 1.2f;
+                if (g_shell.tauAttack > 0.5f) g_shell.tauAttack = 0.5f;
+                needUpdate = TRUE;
+                lastKeyTime = now;
+            }
+            if ((GetAsyncKeyState(VK_DOWN) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
+                g_shell.tauAttack /= 1.2f;
+                if (g_shell.tauAttack < 0.001f) g_shell.tauAttack = 0.001f;
+                needUpdate = TRUE;
+                lastKeyTime = now;
+            }
+
+            /* Release LEFT/RIGHT */
+            if ((GetAsyncKeyState(VK_RIGHT) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
+                g_shell.tauRelease *= 1.2f;
+                if (g_shell.tauRelease > 2.0f) g_shell.tauRelease = 2.0f;
+                needUpdate = TRUE;
+                lastKeyTime = now;
+            }
+            if ((GetAsyncKeyState(VK_LEFT) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
+                g_shell.tauRelease /= 1.2f;
+                if (g_shell.tauRelease < 0.01f) g_shell.tauRelease = 0.01f;
+                needUpdate = TRUE;
+                lastKeyTime = now;
+            }
+
+            /* FFT size F (edge-triggered) */
+            BOOL currF = (GetAsyncKeyState('F') & 0x8000) != 0;
+            if (currF && !prevF) {
+                int newSize = g_audio.fftSize * 2;
+                if (newSize > MAX_FFT_SIZE) newSize = 256;
+                AudioSetFFTSize(&g_audio, newSize);
+                needUpdate = TRUE;
+            }
+            prevF = currF;
+
+            /* Mode type M (edge-triggered) */
+            BOOL currM = (GetAsyncKeyState('M') & 0x8000) != 0;
+            if (currM && !prevM) {
+                g_viz.modeType = (g_viz.modeType + 1) % NUM_MODE_TYPES;
+                needUpdate = TRUE;
+            }
+            prevM = currM;
+
+            /* Color mode V (edge-triggered) */
             BOOL currV = (GetAsyncKeyState('V') & 0x8000) != 0;
             if (currV && !prevV) {
                 g_viz.colorMode = (g_viz.colorMode + 1) % NUM_COLOR_MODES;
@@ -1305,36 +1288,21 @@ int main(int argc, char *argv[]) {
             }
             prevV = currV;
 
-            /* Boundary mode toggle (edge-triggered) */
-            BOOL currP = (GetAsyncKeyState('P') & 0x8000) != 0;
-            if (currP && !prevP) {
-                g_viz.boundary = (g_viz.boundary + 1) % NUM_BOUNDARIES;
-                needUpdate = TRUE;
-            }
-            prevP = currP;
-
-            /* Aspect mode toggle (edge-triggered) */
-            BOOL currR = (GetAsyncKeyState('R') & 0x8000) != 0;
-            if (currR && !prevR) {
-                g_viz.aspectMode = (g_viz.aspectMode + 1) % NUM_ASPECT_MODES;
-                needUpdate = TRUE;
-            }
-            prevR = currR;
-
-            /* Reset to defaults (edge-triggered) */
+            /* Reset SPACE (edge-triggered) */
             BOOL currSpace = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
             if (currSpace && !prevSpace) {
                 VizResetDefaults(&g_viz);
+                g_shell.kappa = 5.0f;
+                g_shell.tauAttack = 0.040f;
+                g_shell.tauRelease = 0.300f;
                 AudioSetFFTSize(&g_audio, DEFAULT_FFT_SIZE);
+                needUpdate = TRUE;
             }
             prevSpace = currSpace;
         } else {
-            /* Reset edge-trigger states when not focused */
-            prevRight = FALSE;
-            prevLeft = FALSE;
+            prevF = FALSE;
+            prevM = FALSE;
             prevV = FALSE;
-            prevP = FALSE;
-            prevR = FALSE;
             prevSpace = FALSE;
             prevAltEnter = FALSE;
         }
@@ -1349,7 +1317,6 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Skip rendering if minimized */
         if (g_viz.w <= 0 || g_viz.h <= 0) {
             Sleep(16);
             continue;
@@ -1359,9 +1326,14 @@ int main(int argc, char *argv[]) {
         if (g_hdc && wglGetCurrentContext()) {
             float *spectrum = AudioGetData(&g_audio);
             if (spectrum) {
-                VizRender(&g_viz, spectrum, g_audio.fftSize);
+                int nBins = g_audio.fftSize / 2 + 1;
+                ShellProcess(&g_shell, spectrum, nBins, g_audio.fftSize);
+                VizRender(&g_viz, &g_shell, dt);
                 SwapBuffers(g_hdc);
-                PrintStatus(&g_viz, g_audio.fftSize);
+
+                if (needUpdate) {
+                    PrintStatus(&g_viz, &g_shell, g_audio.fftSize);
+                }
             }
         } else {
             Sleep(16);
