@@ -1,17 +1,26 @@
 """
-Spectral Shell Visualizer - Constant-Q Standing Wave Synthesis
+CQT Shell Visualizer - Constant-Q Transform Standing Wave Synthesis
 
 Standing wave visualizer with mirror symmetry about x and y axes.
 Uses even-even cosine modes: cos(kx*x) * cos(ky*y)
 
-Shell definition (constant-Q, q = 2^(1/4)):
-    s(m,n) = floor(4 * log2(sqrt(m² + n²)))
+Constant-Q Transform (CQT):
+    - Frequency bins geometrically spaced (12 bins per octave = musical notes)
+    - Variable window lengths: longer for bass, shorter for treble
+    - Matches human perception of time-frequency tradeoff
+    - Great for: chords, key detection, melody tracking, harmonic analysis
 
 Field synthesis (x and y symmetric):
     u(x,y,t) = Σ A_s(m,n)(t) / N_s * cos(kx*x) * cos(ky*y)
 
-Energy rendering:
-    I(x,y,t) = u(x,y,t)²
+Rendering:
+    Water-like surface with specular highlights and fresnel rim lighting.
+    Wave field u is treated as a height map; gradient gives surface normals.
+    96 bins = 8 octaves × 12 semitones (C1 ~32Hz to B8 ~7902Hz)
+
+Water surface lighting model adapted from "Seascape" by Alexander Alekseev (TDM), 2014
+https://www.shadertoy.com/view/Ms2SD1
+License: CC BY-NC-SA 3.0 (https://creativecommons.org/licenses/by-nc-sa/3.0/)
 """
 
 import numpy as np
@@ -34,8 +43,13 @@ MAX_BINS = MAX_FFT_SIZE // 2 + 1
 
 # Maximum number of modes to precompute
 MAX_MODES = 2048
-# Maximum shell index
-MAX_SHELLS = 64
+
+# CQT parameters
+BINS_PER_OCTAVE = 12  # Musical: 12 semitones per octave
+NUM_OCTAVES = 8       # C1 (~32 Hz) to B8 (~7902 Hz)
+NUM_CQT_BINS = BINS_PER_OCTAVE * NUM_OCTAVES  # 96 bins total
+F_MIN = 32.70         # C1 in Hz
+Q_FACTOR = 1.0 / (2 ** (1 / BINS_PER_OCTAVE) - 1)  # Quality factor ~16.82
 
 VERTEX_SHADER = """
 #version 330 core
@@ -54,111 +68,129 @@ in vec2 fragCoord;
 out vec4 outColor;
 
 uniform vec2 iResolution;
-uniform sampler1D iShellAmps;       // Shell amplitudes A_s(t)
-uniform sampler1D iModeData;        // Packed mode data: (kx, ky, shell, inv_count)
+uniform sampler1D iCQTAmps;         // CQT bin amplitudes (96 bins = 8 octaves × 12 semitones)
+uniform sampler1D iModeData;        // Packed mode data: (kx, ky, cqt_bin, inv_count)
 uniform int iNumModes;
-uniform int iNumShells;
+uniform int iNumCQTBins;
 uniform float iTime;
-uniform int iColorMode;             // 0=Plasma, 1=Magma, 2=Turbo, 3=Viridis, 4=Grayscale
-uniform float iContrast;
 uniform float iScale;               // Spatial frequency scale
 uniform int iModeType;              // 0=all, 1=m!=n only, 2=diagonal pairs
+uniform float iTotalEnergy;         // Total energy for normalization
+uniform float iAmplitude;           // Amplitude scaling factor
 
 #define PI 3.14159265
-#define TAU 6.28318530
 
 // ============================================================================
-// COLORMAPS
+// DITHERING
 // ============================================================================
 
-vec3 plasma(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.050383, 0.029803, 0.527975);
-    vec3 c1 = vec3(0.417642, 0.000564, 0.658390);
-    vec3 c2 = vec3(0.692840, 0.165141, 0.564522);
-    vec3 c3 = vec3(0.881443, 0.392529, 0.383229);
-    vec3 c4 = vec3(0.987622, 0.645320, 0.039886);
-    vec3 c5 = vec3(0.940015, 0.975158, 0.131326);
-    if (t >= 1.0) return c5;
-    float s = t * 5.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    return mix(c4, c5, f);
+// Hash function for pseudo-random noise
+float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
 }
 
-vec3 magma(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.001462, 0.000466, 0.013866);
-    vec3 c1 = vec3(0.316654, 0.071862, 0.485380);
-    vec3 c2 = vec3(0.716387, 0.214982, 0.474720);
-    vec3 c3 = vec3(0.974417, 0.462840, 0.359756);
-    vec3 c4 = vec3(0.995131, 0.766837, 0.534094);
-    vec3 c5 = vec3(0.987053, 0.991438, 0.749504);
-    if (t >= 1.0) return c5;
-    float s = t * 5.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    return mix(c4, c5, f);
+// Triangular dithering noise (-0.5 to 0.5, triangular distribution)
+float triangularNoise(vec2 p) {
+    float r1 = hash(p);
+    float r2 = hash(p + vec2(1.0, 0.0));
+    return (r1 + r2) * 0.5 - 0.5;
 }
 
-vec3 turbo(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.18995, 0.07176, 0.23217);
-    vec3 c1 = vec3(0.25107, 0.25237, 0.63374);
-    vec3 c2 = vec3(0.15992, 0.53830, 0.72889);
-    vec3 c3 = vec3(0.09140, 0.74430, 0.54318);
-    vec3 c4 = vec3(0.52876, 0.85393, 0.21546);
-    vec3 c5 = vec3(0.88092, 0.73551, 0.07741);
-    vec3 c6 = vec3(0.97131, 0.45935, 0.05765);
-    vec3 c7 = vec3(0.84299, 0.15070, 0.15090);
-    if (t >= 1.0) return c7;
-    float s = t * 7.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    if (idx == 4) return mix(c4, c5, f);
-    if (idx == 5) return mix(c5, c6, f);
-    return mix(c6, c7, f);
+// ============================================================================
+// WAVE FIELD COMPUTATION
+// ============================================================================
+
+// Rendering parameters
+const float gradientScale = 2.0;        // Scale for gradient calculation
+
+// Compute wave field value at position p (normalized by total energy)
+float computeWaveField(vec2 p) {
+    float u = 0.0;
+    for (int i = 0; i < 2048; i++) {
+        if (i >= iNumModes) break;
+
+        float texCoord = (float(i) + 0.5) / float(iNumModes);
+        vec4 mode = texture(iModeData, texCoord);
+
+        float kx = mode.r;
+        float ky = mode.g;
+        int cqt_bin = int(mode.b);
+        float inv_count = mode.a;
+
+        float cqtCoord = (float(cqt_bin) + 0.5) / float(iNumCQTBins);
+        float A_s = texture(iCQTAmps, cqtCoord).r;
+
+        float mode_val;
+        if (iModeType == 0) {
+            mode_val = cos(kx * p.x) * cos(ky * p.y);
+        } else if (iModeType == 1) {
+            if (abs(kx - ky) < 0.01) continue;
+            mode_val = cos(kx * p.x) * cos(ky * p.y);
+        } else {
+            mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);
+            if (abs(kx - ky) < 0.01) mode_val *= 0.5;
+        }
+
+        u += A_s * inv_count * mode_val;
+    }
+    // Normalize by total energy
+    return u * iAmplitude / max(sqrt(iTotalEnergy), 0.001);
 }
 
-vec3 viridis(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.267004, 0.004874, 0.329415);
-    vec3 c1 = vec3(0.282327, 0.140926, 0.457517);
-    vec3 c2 = vec3(0.253935, 0.265254, 0.529983);
-    vec3 c3 = vec3(0.206756, 0.371758, 0.553117);
-    vec3 c4 = vec3(0.143936, 0.522773, 0.556295);
-    vec3 c5 = vec3(0.119512, 0.607464, 0.540218);
-    vec3 c6 = vec3(0.166383, 0.690856, 0.496502);
-    vec3 c7 = vec3(0.319809, 0.770914, 0.411152);
-    vec3 c8 = vec3(0.525776, 0.833491, 0.288127);
-    vec3 c9 = vec3(0.762373, 0.876424, 0.137064);
-    vec3 c10 = vec3(0.993248, 0.906157, 0.143936);
-    if (t >= 1.0) return c10;
-    float s = t * 10.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    if (idx == 4) return mix(c4, c5, f);
-    if (idx == 5) return mix(c5, c6, f);
-    if (idx == 6) return mix(c6, c7, f);
-    if (idx == 7) return mix(c7, c8, f);
-    if (idx == 8) return mix(c8, c9, f);
-    return mix(c9, c10, f);
+// ============================================================================
+// LIGHTING
+// ============================================================================
+
+// Night sky background
+vec3 getSkyColor(vec3 rd) {
+    float sd = dot(normalize(vec3(-0.5, -0.6, 0.9)), rd) * 0.5 + 0.5;
+    sd = pow(sd, 5.0);
+    vec3 col = mix(vec3(0.05, 0.1, 0.2), vec3(0.1, 0.05, 0.2), sd);
+    return col * 0.63;
+}
+
+// Soft diffuse lighting
+float diffuse(vec3 n, vec3 l, float p) {
+    return pow(dot(n, l) * 0.4 + 0.6, p);
+}
+
+// Normalized specular (energy conserving)
+float specularHighlight(vec3 n, vec3 l, vec3 e, float s) {
+    float nrm = (s + 8.0) / (PI * 8.0);
+    return pow(max(dot(reflect(e, n), l), 0.0), s) * nrm;
+}
+
+// Surface color with height-based variation
+vec3 getSurfaceColor(vec3 n, vec3 light, vec3 eye, float dist, float height) {
+    // Fresnel: edges reflect more (cubic falloff, clamped)
+    float fresnel = clamp(1.0 - dot(n, -eye), 0.0, 1.0);
+    fresnel = min(pow(fresnel, 3.0), 0.5);
+
+    // Reflected sky
+    vec3 reflected = getSkyColor(reflect(eye, n));
+
+    // Refracted/subsurface color - darker water for specular contrast
+    vec3 baseColor = vec3(0.005, 0.01, 0.025);
+    vec3 surfaceColor = vec3(0.05, 0.1, 0.15);
+    vec3 refracted = baseColor + diffuse(n, light, 80.0) * surfaceColor * 0.05;
+
+    // Blend refracted and reflected based on fresnel
+    vec3 color = mix(refracted, reflected, fresnel);
+
+    // Distance attenuation
+    float atten = max(1.0 - dist * dist * 0.001, 0.0);
+    color += surfaceColor * atten * 0.02;
+
+    // Height-based color - wave peaks glow brighter
+    color += surfaceColor * height * 0.5 * atten;
+
+    // Specular with distance-dependent power (inversesqrt like Seascape)
+    float specPower = 600.0 * inversesqrt(max(dist * dist, 0.01));
+    color += vec3(0.8, 0.9, 1.0) * specularHighlight(n, light, eye, specPower) * 1.5;
+
+    return color;
 }
 
 // ============================================================================
@@ -174,69 +206,43 @@ void main() {
     p.x = (uv.x - 0.5) * 2.0 * aspect * iScale;
     p.y = (uv.y - 0.5) * 2.0 * iScale;
 
-    // Field synthesis: u(x,y,t) = Σ A_s / N_s * cos(kx*x) * cos(ky*y)
-    // Even-even symmetry: invariant under x → -x and y → -y
-    float u = 0.0;
+    // Small offset for gradient calculation (in normalized space)
+    float eps = 0.01 * iScale;
 
-    for (int i = 0; i < 2048; i++) {
-        if (i >= iNumModes) break;
+    // Compute wave field at current position
+    float u = computeWaveField(p);
 
-        // Fetch mode data: (kx, ky, shell, inv_count)
-        float texCoord = (float(i) + 0.5) / float(iNumModes);
-        vec4 mode = texture(iModeData, texCoord);
+    // Compute gradient using central differences
+    float u_px = computeWaveField(p + vec2(eps, 0.0));
+    float u_mx = computeWaveField(p - vec2(eps, 0.0));
+    float u_py = computeWaveField(p + vec2(0.0, eps));
+    float u_my = computeWaveField(p - vec2(0.0, eps));
 
-        float kx = mode.r;
-        float ky = mode.g;
-        int shell = int(mode.b);
-        float inv_count = mode.a;
+    vec2 gradient = vec2(u_px - u_mx, u_py - u_my) / (2.0 * eps);
+    gradient *= gradientScale;
 
-        // Get shell amplitude
-        float shellCoord = (float(shell) + 0.5) / float(iNumShells);
-        float A_s = texture(iShellAmps, shellCoord).r;
+    // Surface normal from gradient (wave acts as height field)
+    // Tilt slightly toward viewer for better 3D effect
+    vec3 normal = normalize(vec3(-gradient.x, -gradient.y, 1.0));
 
-        // Standing wave with x and y mirror symmetry
-        float mode_val;
+    // Simulate a 3D view: eye looking down at slight angle
+    vec3 eye = normalize(vec3(uv.x - 0.5, uv.y - 0.5, -1.0));
 
-        if (iModeType == 0) {
-            // All modes: cos(kx*x) * cos(ky*y)
-            mode_val = cos(kx * p.x) * cos(ky * p.y);
-        } else if (iModeType == 1) {
-            // Only m != n modes (skip when kx == ky)
-            if (abs(kx - ky) < 0.01) continue;
-            mode_val = cos(kx * p.x) * cos(ky * p.y);
-        } else {
-            // Diagonal symmetry: cos(kx*x)*cos(ky*y) + cos(ky*x)*cos(kx*y)
-            // This adds 4-fold rotational symmetry (90° invariance)
-            mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);
-            if (abs(kx - ky) < 0.01) mode_val *= 0.5;  // Avoid double-counting m=n
-        }
+    // Light from upper-right, slightly behind viewer
+    vec3 light = normalize(vec3(0.0, 1.0, 0.8));
 
-        u += A_s * inv_count * mode_val;
-    }
+    // Distance from center (for attenuation effects)
+    float dist = length(p);
 
-    // Energy rendering: I = u²
-    float I = u * u;
+    // Get surface color with full lighting model
+    vec3 color = getSurfaceColor(normal, light, eye, dist, u);
 
-    // Apply contrast
-    I = pow(I, 1.0 / iContrast);
+    // Apply gamma correction (linear to sRGB)
+    color = pow(color, vec3(0.65));
 
-    // Soft clamp
-    I = tanh(I * 2.0);
-
-    // Color mapping
-    vec3 color;
-    if (iColorMode == 0) {
-        color = plasma(I);
-    } else if (iColorMode == 1) {
-        color = magma(I);
-    } else if (iColorMode == 2) {
-        color = turbo(I);
-    } else if (iColorMode == 3) {
-        color = viridis(I);
-    } else {
-        // Grayscale
-        color = vec3(I);
-    }
+    // Apply dithering to reduce banding (±0.5/255 in each channel)
+    float dither = triangularNoise(fragCoord) / 255.0;
+    color += dither;
 
     outColor = vec4(color, 1.0);
 }
@@ -244,29 +250,65 @@ void main() {
 
 
 class AudioCapture:
-    def __init__(self, fft_size=8192):
+    """Audio capture with Constant-Q Transform.
+
+    CQT uses geometrically-spaced frequency bins (12 per octave) with
+    variable window lengths - longer for bass, shorter for treble.
+    This matches musical perception and note spacing.
+    """
+
+    def __init__(self):
         self.running = False
         self.thread = None
-        self.fft_size = fft_size
+
+        # Large ring buffer for long bass windows
         self._ring_buffer = np.zeros(MAX_FFT_SIZE * 4, dtype=np.float32)
         self._write_pos = 0
         self._running_max = 0.01
-        self._output = np.zeros(MAX_BINS, dtype=np.float32)
-        self._update_fft_params()
 
-    def _update_fft_params(self):
-        self._n_bins = self.fft_size // 2 + 1
-        self._window = np.hanning(self.fft_size).astype(np.float32)
-        self._spectrum = np.zeros(self._n_bins, dtype=np.float32)
-        self._running_max = 0.01
+        # Precompute CQT kernels
+        self._init_cqt_kernels()
 
-    def set_fft_size(self, size, viz=None):
-        size = max(256, min(MAX_FFT_SIZE, size))
-        if size != self.fft_size:
-            self.fft_size = size
-            self._update_fft_params()
-            if viz:
-                viz.print_status()
+        # Output
+        self._cqt_output = np.zeros(NUM_CQT_BINS, dtype=np.float32)
+
+    def _init_cqt_kernels(self):
+        """Precompute CQT analysis kernels for each frequency bin.
+
+        For each bin k:
+            f_k = f_min * 2^(k/bins_per_octave)
+            N_k = ceil(Q * fs / f_k)  # Window length (longer for low freq)
+            kernel_k = window(N_k) * exp(-2πi * Q * n / N_k)
+        """
+        self.cqt_freqs = np.zeros(NUM_CQT_BINS)
+        self.cqt_window_lens = np.zeros(NUM_CQT_BINS, dtype=np.int32)
+        self.cqt_kernels = []
+
+        for k in range(NUM_CQT_BINS):
+            # Center frequency for this bin
+            freq = F_MIN * (2 ** (k / BINS_PER_OCTAVE))
+            self.cqt_freqs[k] = freq
+
+            # Window length: N_k = Q * fs / f_k
+            # Longer windows for low frequencies, shorter for high
+            N_k = int(np.ceil(Q_FACTOR * SAMPLE_RATE / freq))
+            N_k = min(N_k, MAX_FFT_SIZE)  # Cap at max buffer
+            self.cqt_window_lens[k] = N_k
+
+            # Complex exponential kernel with Hann window
+            n = np.arange(N_k)
+            window = 0.5 - 0.5 * np.cos(2 * np.pi * n / N_k)  # Hann window
+            kernel = window * np.exp(-2j * np.pi * Q_FACTOR * n / N_k)
+            kernel = kernel / N_k  # Normalize
+
+            self.cqt_kernels.append(kernel.astype(np.complex64))
+
+        max_window = np.max(self.cqt_window_lens)
+        min_window = np.min(self.cqt_window_lens)
+        print(f"CQT initialized: {NUM_CQT_BINS} bins, {BINS_PER_OCTAVE}/octave")
+        print(f"  Freq range: {self.cqt_freqs[0]:.1f} Hz - {self.cqt_freqs[-1]:.1f} Hz")
+        print(f"  Window range: {min_window} - {max_window} samples")
+        print(f"  Time resolution: {min_window/SAMPLE_RATE*1000:.1f} - {max_window/SAMPLE_RATE*1000:.1f} ms")
 
     def start(self):
         self.running = True
@@ -309,47 +351,71 @@ class AudioCapture:
         except Exception as e:
             print(f"Audio error: {e}")
 
-    def get_spectrum(self):
-        fft_size = self.fft_size
-        n_bins = fft_size // 2 + 1
+    def get_cqt(self):
+        """Compute Constant-Q Transform using precomputed kernels.
 
+        Each bin uses a different window length, providing:
+        - Better frequency resolution for bass (long windows)
+        - Better time resolution for treble (short windows)
+        """
         current_pos = self._write_pos
         buf_len = len(self._ring_buffer)
-        start = (current_pos - fft_size) % buf_len
 
-        if start + fft_size <= buf_len:
-            samples = self._ring_buffer[start:start + fft_size].copy()
-        else:
-            first_part = buf_len - start
-            samples = np.concatenate([self._ring_buffer[start:], self._ring_buffer[:fft_size - first_part]])
+        for k in range(NUM_CQT_BINS):
+            N_k = self.cqt_window_lens[k]
+            kernel = self.cqt_kernels[k]
 
-        magnitude = np.abs(np.fft.rfft(samples * self._window[:fft_size]))
-        self._spectrum[:n_bins] = magnitude
+            # Extract samples for this bin's window length
+            start = (current_pos - N_k) % buf_len
 
-        current_max = np.max(self._spectrum[:n_bins])
+            if start + N_k <= buf_len:
+                samples = self._ring_buffer[start:start + N_k]
+            else:
+                first_part = buf_len - start
+                samples = np.concatenate([
+                    self._ring_buffer[start:],
+                    self._ring_buffer[:N_k - first_part]
+                ])
+
+            # Convolve with kernel (dot product for matched frequency)
+            self._cqt_output[k] = np.abs(np.dot(samples, kernel))
+
+        # Adaptive normalization with slower response and much higher floor
+        # This prevents over-saturation at loud volumes
+        current_max = np.max(self._cqt_output)
+
+        # Slow attack (don't jump up instantly), slower release
         if current_max > self._running_max:
-            self._running_max = current_max
+            # Very slow attack
+            self._running_max += 0.01 * (current_max - self._running_max)
         else:
-            self._running_max = max(self._running_max * 0.995, current_max, 0.01)
+            # Very slow release
+            self._running_max = max(self._running_max * 0.999, current_max, 0.0001)
 
-        normalized = np.clip(self._spectrum[:n_bins] / (self._running_max + 1e-6), 0.0, 1.5)
+        # Use much higher reference point to leave lots of headroom
+        # 5x headroom means normal volume sits around 20% amplitude
+        reference = self._running_max * 5.0 + 0.0001
 
-        self._output[:] = 0
-        self._output[:n_bins] = normalized
-        return self._output, n_bins
+        normalized = np.clip(self._cqt_output / reference, 0.0, 1.0)
+
+        return normalized
 
 
-class ShellProcessor:
-    """Maps FFT bins to constant-Q shells and computes shell amplitudes."""
+class CQTProcessor:
+    """Maps CQT bins to spatial modes for visualization.
 
-    def __init__(self, num_shells=MAX_SHELLS, kappa=5.0, tau_attack=0.040, tau_release=0.300):
-        self.num_shells = num_shells
+    Each CQT bin (musical note) drives a set of spatial modes.
+    96 bins = 8 octaves × 12 semitones (C1 to B8).
+    """
+
+    def __init__(self, kappa=5.0, tau_attack=0.040, tau_release=0.300):
+        self.num_bins = NUM_CQT_BINS
         self.kappa = kappa  # Log compression factor
         self.tau_attack = tau_attack
         self.tau_release = tau_release
 
-        # Shell amplitudes A_s(t)
-        self.shell_amps = np.zeros(num_shells, dtype=np.float32)
+        # CQT bin amplitudes A_k(t)
+        self.cqt_amps = np.zeros(NUM_CQT_BINS, dtype=np.float32)
 
         # Precompute mode data
         self._init_modes()
@@ -357,124 +423,117 @@ class ShellProcessor:
         self._last_time = time.time()
 
     def _init_modes(self):
-        """Precompute (m,n) modes and their shells. No random phases needed."""
+        """Precompute simple modes - one per CQT bin.
+
+        Much simpler mapping: each musical note gets ONE distinct spatial mode.
+        Lower notes = lower spatial frequency, higher notes = higher spatial frequency.
+        This creates clear, readable patterns tied directly to the music.
+        """
         modes = []
-        shell_counts = np.zeros(self.num_shells, dtype=np.int32)
+        bin_counts = np.zeros(self.num_bins, dtype=np.int32)
 
-        # Generate modes for m,n >= 0 only (symmetry handled by cos*cos)
-        # cos(kx*x)*cos(ky*y) is already symmetric about x and y axes
-        max_mn = 32  # Covers shells up to ~20
+        # Simple approach: each CQT bin gets one mode
+        # Spatial frequency grows with pitch
+        # Use different (m,n) combinations for variety within each octave
 
-        for m in range(0, max_mn + 1):
-            for n in range(0, max_mn + 1):
-                if m == 0 and n == 0:  # Skip DC
-                    continue
+        # Mode patterns for the 12 semitones (gives visual variety)
+        # These are (m,n) offsets that create different shapes
+        semitone_patterns = [
+            (1, 0),   # C  - horizontal
+            (1, 1),   # C# - diagonal
+            (0, 1),   # D  - vertical
+            (2, 1),   # D# - angled
+            (1, 2),   # E  - angled other way
+            (2, 0),   # F  - horizontal 2nd harmonic
+            (2, 2),   # F# - diagonal 2nd
+            (0, 2),   # G  - vertical 2nd
+            (3, 1),   # G# - complex
+            (1, 3),   # A  - complex other
+            (3, 2),   # A# - complex
+            (2, 3),   # B  - complex other
+        ]
 
-                r = np.sqrt(m*m + n*n)
+        for k in range(self.num_bins):
+            octave = k // BINS_PER_OCTAVE  # 0-7
+            semitone = k % BINS_PER_OCTAVE  # 0-11
 
-                # Shell index: s = floor(4 * log2(r))
-                s = int(np.floor(4 * np.log2(r)))
-                if s < 0 or s >= self.num_shells:
-                    continue
+            # Base spatial frequency scales with octave (doubles each octave)
+            base_freq = 2 ** (octave / 2.0)  # Slower growth for visibility
 
-                # Wave vector (using π scaling for nice periodicity)
-                kx = m * np.pi
-                ky = n * np.pi
+            # Get pattern for this semitone
+            m_base, n_base = semitone_patterns[semitone]
 
-                modes.append((kx, ky, s))
-                shell_counts[s] += 1
+            # Scale by octave
+            m = max(1, int(m_base * base_freq))
+            n = max(0, int(n_base * base_freq))
+
+            # Ensure we don't have (0,0)
+            if m == 0 and n == 0:
+                m = 1
+
+            kx = m * np.pi
+            ky = n * np.pi
+
+            modes.append((kx, ky, k))
+            bin_counts[k] = 1
 
         self.modes = modes
-        self.shell_counts = shell_counts
+        self.bin_counts = bin_counts
         self.num_modes = len(modes)
 
-        # Pack mode data for GPU: (kx, ky, shell, 1/N_s)
+        # Pack mode data for GPU: (kx, ky, cqt_bin, 1/N_k)
         self.mode_data = np.zeros((self.num_modes, 4), dtype=np.float32)
-        for i, (kx, ky, s) in enumerate(modes):
-            inv_count = 1.0 / max(1, shell_counts[s])
-            self.mode_data[i] = [kx, ky, float(s), inv_count]
+        for i, (kx, ky, k) in enumerate(modes):
+            inv_count = 1.0  # Each bin has exactly one mode
+            self.mode_data[i] = [kx, ky, float(k), inv_count]
 
-        print(f"Initialized {self.num_modes} modes across {np.sum(shell_counts > 0)} active shells")
+        print(f"Simple mode mapping: {self.num_modes} modes (1 per CQT bin)")
 
-    def _bin_to_shell(self, bin_idx, n_bins, freq_per_bin):
-        """Map FFT bin to shell index using constant-Q."""
-        freq = bin_idx * freq_per_bin
-        if freq < 20:  # Below audible
-            return -1
-
-        # Map frequency to approximate (m,n) radius
-        # Assume base frequency maps to r=1
-        base_freq = 40.0  # Hz
-        r = freq / base_freq
-
-        if r < 1:
-            return -1
-
-        # Shell index: s = floor(4 * log2(r))
-        s = int(np.floor(4 * np.log2(r)))
-        return min(s, self.num_shells - 1)
-
-    def process(self, spectrum, n_bins, fft_size):
-        """Process spectrum into shell amplitudes with attack/release dynamics."""
+    def process(self, cqt_spectrum):
+        """Process CQT spectrum into smoothed amplitudes with attack/release dynamics."""
         now = time.time()
         dt = now - self._last_time
         self._last_time = now
 
-        freq_per_bin = SAMPLE_RATE / fft_size
-
-        # Compute raw shell energies from FFT
-        shell_energy_raw = np.zeros(self.num_shells, dtype=np.float32)
-
-        for i in range(1, n_bins):
-            s = self._bin_to_shell(i, n_bins, freq_per_bin)
-            if 0 <= s < self.num_shells:
-                shell_energy_raw[s] += spectrum[i] ** 2
-
-        # Log compression: E_s = log(1 + κ * E_raw)
-        E_s = np.log(1 + self.kappa * shell_energy_raw)
+        # Log compression: E_k = log(1 + κ * spectrum²)
+        E_k = np.log(1 + self.kappa * cqt_spectrum ** 2)
 
         # Attack/release smoothing
-        # α = 1 - exp(-dt/τ)
         alpha_attack = 1 - np.exp(-dt / self.tau_attack)
         alpha_release = 1 - np.exp(-dt / self.tau_release)
 
-        # A_s ← A_s + α * (E_s - A_s)
-        rising = E_s > self.shell_amps
-        self.shell_amps[rising] += alpha_attack * (E_s[rising] - self.shell_amps[rising])
-        self.shell_amps[~rising] += alpha_release * (E_s[~rising] - self.shell_amps[~rising])
+        # A_k ← A_k + α * (E_k - A_k)
+        rising = E_k > self.cqt_amps
+        self.cqt_amps[rising] += alpha_attack * (E_k[rising] - self.cqt_amps[rising])
+        self.cqt_amps[~rising] += alpha_release * (E_k[~rising] - self.cqt_amps[~rising])
 
-        return self.shell_amps
+        return self.cqt_amps
 
 
 class Visualizer:
-    DEFAULT_CONTRAST = 1.5
-    DEFAULT_SCALE = 1.0
-    DEFAULT_COLOR_MODE = 0  # Plasma
-    DEFAULT_FFT_SIZE = 8192
-    DEFAULT_KAPPA = 5.0
+    DEFAULT_SCALE = 0.5
+    DEFAULT_KAPPA = 1.0  # Lower = more dynamic range, less compression
     DEFAULT_TAU_ATTACK = 0.040
     DEFAULT_TAU_RELEASE = 0.300
+    DEFAULT_AMPLITUDE = 0.1
 
     def __init__(self, w, h):
         self.w, self.h = w, h
-        self._fft_size = self.DEFAULT_FFT_SIZE
-        self._color_names = ["Plasma", "Magma", "Turbo", "Viridis", "Grayscale"]
         self._mode_type_names = ["All", "m!=n", "Diagonal"]
         self._time = 0.0
         self.reset_defaults()
 
     def reset_defaults(self):
-        self.contrast = self.DEFAULT_CONTRAST
         self.scale = self.DEFAULT_SCALE
-        self.color_mode = self.DEFAULT_COLOR_MODE
         self.mode_type = 0  # All modes
         self.kappa = self.DEFAULT_KAPPA
         self.tau_attack = self.DEFAULT_TAU_ATTACK
         self.tau_release = self.DEFAULT_TAU_RELEASE
+        self.amplitude = self.DEFAULT_AMPLITUDE
         self.print_status()
 
-    def init(self, shell_processor):
-        self.shell_processor = shell_processor
+    def init(self, cqt_processor):
+        self.cqt_processor = cqt_processor
 
         self.program = compileProgram(
             compileShader(VERTEX_SHADER, GL_VERTEX_SHADER),
@@ -495,39 +554,35 @@ class Visualizer:
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, None)
         glEnableVertexAttribArray(0)
 
-        # 1D texture for shell amplitudes
-        self.shell_tex = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_1D, self.shell_tex)
+        # 1D texture for CQT amplitudes (96 bins)
+        self.cqt_tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_1D, self.cqt_tex)
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, MAX_SHELLS, 0, GL_RED, GL_FLOAT, None)
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, NUM_CQT_BINS, 0, GL_RED, GL_FLOAT, None)
 
-        # 1D texture for mode data (RGBA: kx, ky, theta, shell+inv_count)
+        # 1D texture for mode data (RGBA: kx, ky, cqt_bin, inv_count)
         self.mode_tex = glGenTextures(1)
         glBindTexture(GL_TEXTURE_1D, self.mode_tex)
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA32F, shell_processor.num_modes, 0,
-                     GL_RGBA, GL_FLOAT, shell_processor.mode_data)
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA32F, cqt_processor.num_modes, 0,
+                     GL_RGBA, GL_FLOAT, cqt_processor.mode_data)
 
         self.locs = {
             'iResolution': glGetUniformLocation(self.program, "iResolution"),
-            'iShellAmps': glGetUniformLocation(self.program, "iShellAmps"),
+            'iCQTAmps': glGetUniformLocation(self.program, "iCQTAmps"),
             'iModeData': glGetUniformLocation(self.program, "iModeData"),
             'iNumModes': glGetUniformLocation(self.program, "iNumModes"),
-            'iNumShells': glGetUniformLocation(self.program, "iNumShells"),
+            'iNumCQTBins': glGetUniformLocation(self.program, "iNumCQTBins"),
             'iTime': glGetUniformLocation(self.program, "iTime"),
-            'iColorMode': glGetUniformLocation(self.program, "iColorMode"),
-            'iContrast': glGetUniformLocation(self.program, "iContrast"),
             'iScale': glGetUniformLocation(self.program, "iScale"),
             'iModeType': glGetUniformLocation(self.program, "iModeType"),
+            'iTotalEnergy': glGetUniformLocation(self.program, "iTotalEnergy"),
+            'iAmplitude': glGetUniformLocation(self.program, "iAmplitude"),
         }
-
-    def set_contrast(self, value):
-        self.contrast = max(0.1, min(5.0, value))
-        self.print_status()
 
     def set_scale(self, value):
         self.scale = max(0.1, min(10.0, value))
@@ -535,52 +590,57 @@ class Visualizer:
 
     def set_kappa(self, value):
         self.kappa = max(0.1, min(50.0, value))
-        self.shell_processor.kappa = self.kappa
+        self.cqt_processor.kappa = self.kappa
         self.print_status()
 
     def set_tau_attack(self, value):
         self.tau_attack = max(0.001, min(0.5, value))
-        self.shell_processor.tau_attack = self.tau_attack
+        self.cqt_processor.tau_attack = self.tau_attack
         self.print_status()
 
     def set_tau_release(self, value):
         self.tau_release = max(0.01, min(2.0, value))
-        self.shell_processor.tau_release = self.tau_release
+        self.cqt_processor.tau_release = self.tau_release
+        self.print_status()
+
+    def set_amplitude(self, value):
+        self.amplitude = max(0.01, min(5.0, value))
         self.print_status()
 
     def print_status(self):
-        color_str = self._color_names[self.color_mode]
         mode_str = self._mode_type_names[self.mode_type]
-        status = (f"Scale={self.scale:.2f}  Contrast={self.contrast:.1f}  "
+        status = (f"Scale={self.scale:.2f}  Amp={self.amplitude:.2f}  "
                   f"Kappa={self.kappa:.1f}  Attack={self.tau_attack*1000:.0f}ms  "
                   f"Release={self.tau_release*1000:.0f}ms  "
-                  f"Mode={mode_str}  Color={color_str}  FFT={self._fft_size}")
+                  f"Mode={mode_str}")
         print(status)
 
-    def render(self, shell_amps, fft_size, dt):
-        self._fft_size = fft_size
+    def render(self, cqt_amps, dt):
         self._time += dt
 
-        # Update shell amplitudes texture
-        glBindTexture(GL_TEXTURE_1D, self.shell_tex)
-        glTexSubImage1D(GL_TEXTURE_1D, 0, 0, len(shell_amps), GL_RED, GL_FLOAT, shell_amps)
+        # Compute total energy (sum of squared amplitudes)
+        total_energy = np.sum(cqt_amps ** 2)
+
+        # Update CQT amplitudes texture
+        glBindTexture(GL_TEXTURE_1D, self.cqt_tex)
+        glTexSubImage1D(GL_TEXTURE_1D, 0, 0, len(cqt_amps), GL_RED, GL_FLOAT, cqt_amps)
 
         glViewport(0, 0, self.w, self.h)
         glClear(GL_COLOR_BUFFER_BIT)
 
         glUseProgram(self.program)
         glUniform2f(self.locs['iResolution'], self.w, self.h)
-        glUniform1i(self.locs['iNumModes'], self.shell_processor.num_modes)
-        glUniform1i(self.locs['iNumShells'], MAX_SHELLS)
+        glUniform1i(self.locs['iNumModes'], self.cqt_processor.num_modes)
+        glUniform1i(self.locs['iNumCQTBins'], NUM_CQT_BINS)
         glUniform1f(self.locs['iTime'], self._time)
-        glUniform1i(self.locs['iColorMode'], self.color_mode)
-        glUniform1f(self.locs['iContrast'], self.contrast)
         glUniform1f(self.locs['iScale'], self.scale)
         glUniform1i(self.locs['iModeType'], self.mode_type)
+        glUniform1f(self.locs['iTotalEnergy'], float(total_energy))
+        glUniform1f(self.locs['iAmplitude'], self.amplitude)
 
         glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_1D, self.shell_tex)
-        glUniform1i(self.locs['iShellAmps'], 0)
+        glBindTexture(GL_TEXTURE_1D, self.cqt_tex)
+        glUniform1i(self.locs['iCQTAmps'], 0)
 
         glActiveTexture(GL_TEXTURE1)
         glBindTexture(GL_TEXTURE_1D, self.mode_tex)
@@ -604,7 +664,7 @@ def main():
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 
-    window = glfw.create_window(win_w, win_h, "Spectral Shell Visualizer", None, None)
+    window = glfw.create_window(win_w, win_h, "CQT Shell Visualizer", None, None)
     if not window:
         glfw.terminate()
         return
@@ -613,9 +673,15 @@ def main():
     glfw.make_context_current(window)
     glfw.swap_interval(1)
 
-    shell_proc = ShellProcessor()
+    cqt_proc = CQTProcessor()
     viz = Visualizer(win_w, win_h)
-    viz.init(shell_proc)
+    viz.init(cqt_proc)
+
+    # Sync visualizer defaults to processor
+    cqt_proc.kappa = viz.kappa
+    cqt_proc.tau_attack = viz.tau_attack
+    cqt_proc.tau_release = viz.tau_release
+
     audio = AudioCapture()
     audio.start()
     time.sleep(0.05)
@@ -647,9 +713,9 @@ def main():
             viz.w, viz.h = screen_w, screen_h
             is_fullscreen = True
 
-    print("Spectral Shell Visualizer - Constant-Q Standing Wave Synthesis")
-    print("Controls: W/S=scale  Z/X=contrast  K/L=kappa  UP/DOWN=attack  LEFT/RIGHT=release")
-    print("          M=mode type  V=color  F=FFT size  ALT+ENTER=fullscreen  SPACE=reset  ESC=quit")
+    print("CQT Shell Visualizer - Constant-Q Transform Standing Wave Synthesis")
+    print("Controls: W/S=scale  Z/X=amplitude  K/L=kappa  UP/DOWN=attack  LEFT/RIGHT=release")
+    print("          M=mode  ALT+ENTER=fullscreen  SPACE=reset  ESC=quit")
     print()
     viz.print_status()
 
@@ -694,9 +760,9 @@ def main():
             viz.set_scale(viz.scale / 1.1)
 
         if key_ready(glfw.KEY_X):
-            viz.set_contrast(viz.contrast + 0.1)
+            viz.set_amplitude(viz.amplitude * 1.2)
         if key_ready(glfw.KEY_Z):
-            viz.set_contrast(viz.contrast - 0.1)
+            viz.set_amplitude(viz.amplitude / 1.2)
 
         if key_ready(glfw.KEY_L):
             viz.set_kappa(viz.kappa * 1.2)
@@ -713,28 +779,19 @@ def main():
         if key_ready(glfw.KEY_LEFT):
             viz.set_tau_release(viz.tau_release / 1.2)
 
-        if key_pressed(glfw.KEY_F):
-            new_size = audio.fft_size * 2 if audio.fft_size < MAX_FFT_SIZE else 256
-            audio.set_fft_size(new_size, viz)
-
         if key_pressed(glfw.KEY_M):
             viz.mode_type = (viz.mode_type + 1) % len(viz._mode_type_names)
             viz.print_status()
 
-        if key_pressed(glfw.KEY_V):
-            viz.color_mode = (viz.color_mode + 1) % len(viz._color_names)
-            viz.print_status()
-
         if key_pressed(glfw.KEY_SPACE):
             viz.reset_defaults()
-            shell_proc.kappa = viz.kappa
-            shell_proc.tau_attack = viz.tau_attack
-            shell_proc.tau_release = viz.tau_release
-            audio.set_fft_size(Visualizer.DEFAULT_FFT_SIZE, viz)
+            cqt_proc.kappa = viz.kappa
+            cqt_proc.tau_attack = viz.tau_attack
+            cqt_proc.tau_release = viz.tau_release
 
-        spectrum, n_bins = audio.get_spectrum()
-        shell_amps = shell_proc.process(spectrum, n_bins, audio.fft_size)
-        viz.render(shell_amps, audio.fft_size, dt)
+        cqt_spectrum = audio.get_cqt()
+        cqt_amps = cqt_proc.process(cqt_spectrum)
+        viz.render(cqt_amps, dt)
         glfw.swap_buffers(window)
 
     print()

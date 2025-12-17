@@ -8,106 +8,185 @@
 //
 // Controls (keyboard - handled by Buffer A):
 //   W/S: Scale (zoom) +/-
-//   Z/X: Contrast +/-
+//   Z/X: Amplitude +/-
 //   K/L: Kappa (log compression) -/+
+//   UP/DOWN: Attack time +/-
+//   LEFT/RIGHT: Release time +/-
 //   M: Cycle mode type (All, m!=n, Diagonal)
-//   V: Cycle color mode (Plasma, Magma, Turbo, Viridis, Grayscale)
 //   SPACE: Reset to defaults
+//
+// Water surface lighting adapted from "Seascape" by Alexander Alekseev (TDM), 2014
+// https://www.shadertoy.com/view/Ms2SD1 - CC BY-NC-SA 3.0
 
 #define PI 3.14159265
 
 // ============================================================================
-// COLORMAPS
+// DITHERING
 // ============================================================================
 
-vec3 plasma(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.050383, 0.029803, 0.527975);
-    vec3 c1 = vec3(0.417642, 0.000564, 0.658390);
-    vec3 c2 = vec3(0.692840, 0.165141, 0.564522);
-    vec3 c3 = vec3(0.881443, 0.392529, 0.383229);
-    vec3 c4 = vec3(0.987622, 0.645320, 0.039886);
-    vec3 c5 = vec3(0.940015, 0.975158, 0.131326);
-    if (t >= 1.0) return c5;
-    float s = t * 5.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    return mix(c4, c5, f);
+// Hash function for pseudo-random noise
+float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
 }
 
-vec3 magma(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.001462, 0.000466, 0.013866);
-    vec3 c1 = vec3(0.316654, 0.071862, 0.485380);
-    vec3 c2 = vec3(0.716387, 0.214982, 0.474720);
-    vec3 c3 = vec3(0.974417, 0.462840, 0.359756);
-    vec3 c4 = vec3(0.995131, 0.766837, 0.534094);
-    vec3 c5 = vec3(0.987053, 0.991438, 0.749504);
-    if (t >= 1.0) return c5;
-    float s = t * 5.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    return mix(c4, c5, f);
+// Triangular dithering noise (-0.5 to 0.5, triangular distribution)
+float triangularNoise(vec2 p) {
+    float r1 = hash(p);
+    float r2 = hash(p + vec2(1.0, 0.0));
+    return (r1 + r2) * 0.5 - 0.5;
 }
 
-vec3 turbo(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.18995, 0.07176, 0.23217);
-    vec3 c1 = vec3(0.25107, 0.25237, 0.63374);
-    vec3 c2 = vec3(0.15992, 0.53830, 0.72889);
-    vec3 c3 = vec3(0.09140, 0.74430, 0.54318);
-    vec3 c4 = vec3(0.52876, 0.85393, 0.21546);
-    vec3 c5 = vec3(0.88092, 0.73551, 0.07741);
-    vec3 c6 = vec3(0.97131, 0.45935, 0.05765);
-    vec3 c7 = vec3(0.84299, 0.15070, 0.15090);
-    if (t >= 1.0) return c7;
-    float s = t * 7.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    if (idx == 4) return mix(c4, c5, f);
-    if (idx == 5) return mix(c5, c6, f);
-    return mix(c6, c7, f);
+// ============================================================================
+// WAVE FIELD COMPUTATION
+// ============================================================================
+
+// Rendering parameters
+const float gradientScale = 2.0;  // Scale for gradient calculation
+
+// Semitone patterns for mode mapping (m, n offsets for each of 12 semitones)
+// These create different shapes for each note in an octave
+const vec2 semitonePatterns[12] = vec2[12](
+    vec2(1, 0),   // C  - horizontal
+    vec2(1, 1),   // C# - diagonal
+    vec2(0, 1),   // D  - vertical
+    vec2(2, 1),   // D# - angled
+    vec2(1, 2),   // E  - angled other way
+    vec2(2, 0),   // F  - horizontal 2nd harmonic
+    vec2(2, 2),   // F# - diagonal 2nd
+    vec2(0, 2),   // G  - vertical 2nd
+    vec2(3, 1),   // G# - complex
+    vec2(1, 3),   // A  - complex other
+    vec2(3, 2),   // A# - complex
+    vec2(2, 3)    // B  - complex other
+);
+
+// CQT parameters
+#define BINS_PER_OCTAVE 12
+#define NUM_OCTAVES 8
+#define NUM_CQT_BINS 96  // 8 octaves * 12 semitones
+#define F_MIN 32.70      // C1 in Hz
+
+// Compute wave field value at position p
+float computeWaveField(vec2 p, int modeType, float kappa, out float totalEnergy) {
+    float u = 0.0;
+    totalEnergy = 0.0;
+
+    // Process each CQT bin (musical note)
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        int octave = k / BINS_PER_OCTAVE;  // 0-7
+        int semitone = k - octave * BINS_PER_OCTAVE;  // 0-11
+
+        // Base spatial frequency scales with octave
+        float baseFreq = pow(2.0, float(octave) / 2.0);
+
+        // Get pattern for this semitone
+        vec2 pattern = semitonePatterns[semitone];
+
+        // Scale by octave
+        float m = max(1.0, floor(pattern.x * baseFreq));
+        float n = max(0.0, floor(pattern.y * baseFreq));
+
+        // Ensure we don't have (0,0)
+        if (m < 0.5 && n < 0.5) m = 1.0;
+
+        float kx = m * PI;
+        float ky = n * PI;
+
+        // Get amplitude for this CQT bin from audio
+        // Map CQT bin to frequency: f_k = F_MIN * 2^(k/BINS_PER_OCTAVE)
+        float freq = F_MIN * pow(2.0, float(k) / float(BINS_PER_OCTAVE));
+
+        // Shadertoy audio: 512 bins covering 0-11025 Hz (at 44.1kHz sample rate)
+        // Spectrum is in first row (y=0), wave in second row (y=1)
+        float audioU = freq / 11025.0;
+        if (audioU > 1.0) continue;
+
+        float v = texture(iChannel0, vec2(audioU, 0.0)).x;
+
+        // Convert from dB to linear amplitude
+        float dB = -100.0 + v * 70.0;
+        float amp = pow(10.0, dB / 20.0);
+
+        // Log compression: E_k = log(1 + κ * amp²)
+        float E_k = log(1.0 + kappa * amp * amp);
+
+        if (E_k < 0.001) continue;
+
+        float mode_val;
+        if (modeType == 0) {
+            // All modes
+            mode_val = cos(kx * p.x) * cos(ky * p.y);
+        } else if (modeType == 1) {
+            // m != n only
+            if (abs(m - n) < 0.5) continue;
+            mode_val = cos(kx * p.x) * cos(ky * p.y);
+        } else {
+            // Diagonal pairs
+            mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);
+            if (abs(m - n) < 0.5) mode_val *= 0.5;
+        }
+
+        u += E_k * mode_val;
+        totalEnergy += E_k * E_k;
+    }
+
+    return u;
 }
 
-vec3 viridis(float t) {
-    t = clamp(t, 0.0, 1.0);
-    vec3 c0 = vec3(0.267004, 0.004874, 0.329415);
-    vec3 c1 = vec3(0.282327, 0.140926, 0.457517);
-    vec3 c2 = vec3(0.253935, 0.265254, 0.529983);
-    vec3 c3 = vec3(0.206756, 0.371758, 0.553117);
-    vec3 c4 = vec3(0.143936, 0.522773, 0.556295);
-    vec3 c5 = vec3(0.119512, 0.607464, 0.540218);
-    vec3 c6 = vec3(0.166383, 0.690856, 0.496502);
-    vec3 c7 = vec3(0.319809, 0.770914, 0.411152);
-    vec3 c8 = vec3(0.525776, 0.833491, 0.288127);
-    vec3 c9 = vec3(0.762373, 0.876424, 0.137064);
-    vec3 c10 = vec3(0.993248, 0.906157, 0.143936);
-    if (t >= 1.0) return c10;
-    float s = t * 10.0;
-    int idx = int(floor(s));
-    float f = fract(s);
-    if (idx == 0) return mix(c0, c1, f);
-    if (idx == 1) return mix(c1, c2, f);
-    if (idx == 2) return mix(c2, c3, f);
-    if (idx == 3) return mix(c3, c4, f);
-    if (idx == 4) return mix(c4, c5, f);
-    if (idx == 5) return mix(c5, c6, f);
-    if (idx == 6) return mix(c6, c7, f);
-    if (idx == 7) return mix(c7, c8, f);
-    if (idx == 8) return mix(c8, c9, f);
-    return mix(c9, c10, f);
+// ============================================================================
+// LIGHTING
+// ============================================================================
+
+// Night sky background
+vec3 getSkyColor(vec3 rd) {
+    float sd = dot(normalize(vec3(-0.5, -0.6, 0.9)), rd) * 0.5 + 0.5;
+    sd = pow(sd, 5.0);
+    vec3 col = mix(vec3(0.05, 0.1, 0.2), vec3(0.1, 0.05, 0.2), sd);
+    return col * 0.63;
+}
+
+// Soft diffuse lighting
+float diffuse(vec3 n, vec3 l, float p) {
+    return pow(dot(n, l) * 0.4 + 0.6, p);
+}
+
+// Normalized specular (energy conserving)
+float specularHighlight(vec3 n, vec3 l, vec3 e, float s) {
+    float nrm = (s + 8.0) / (PI * 8.0);
+    return pow(max(dot(reflect(e, n), l), 0.0), s) * nrm;
+}
+
+// Surface color with height-based variation
+vec3 getSurfaceColor(vec3 n, vec3 light, vec3 eye, float dist, float height) {
+    // Fresnel: edges reflect more (cubic falloff, clamped)
+    float fresnel = clamp(1.0 - dot(n, -eye), 0.0, 1.0);
+    fresnel = min(pow(fresnel, 3.0), 0.5);
+
+    // Reflected sky
+    vec3 reflected = getSkyColor(reflect(eye, n));
+
+    // Refracted/subsurface color - darker water for specular contrast
+    vec3 baseColor = vec3(0.005, 0.01, 0.025);
+    vec3 surfaceColor = vec3(0.05, 0.1, 0.15);
+    vec3 refracted = baseColor + diffuse(n, light, 80.0) * surfaceColor * 0.05;
+
+    // Blend refracted and reflected based on fresnel
+    vec3 color = mix(refracted, reflected, fresnel);
+
+    // Distance attenuation
+    float atten = max(1.0 - dist * dist * 0.001, 0.0);
+    color += surfaceColor * atten * 0.02;
+
+    // Height-based color - wave peaks glow brighter
+    color += surfaceColor * height * 0.5 * atten;
+
+    // Specular with distance-dependent power
+    float specPower = 600.0 * inversesqrt(max(dist * dist, 0.01));
+    color += vec3(0.8, 0.9, 1.0) * specularHighlight(n, light, eye, specPower) * 1.5;
+
+    return color;
 }
 
 // ============================================================================
@@ -123,109 +202,66 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec4 state1 = texelFetch(iChannel1, ivec2(1, 0), 0);
 
     float scale = state0.x;
-    float contrast = state0.y;
+    float amplitude = state0.y;
     float kappa = state0.z;
-    int colorMode = int(state0.w);
     int modeType = int(state1.x);
 
     // Fallback defaults
     if (scale < 0.01) {
-        scale = 1.0;
-        contrast = 1.5;
+        scale = 0.5;
+        amplitude = 0.1;
         kappa = 5.0;
-        colorMode = 0;
         modeType = 0;
     }
 
-    // Normalized coordinates
+    // Normalized coordinates centered at origin, scaled
     vec2 p;
     p.x = (uv.x - 0.5) * 2.0 * aspect * scale;
     p.y = (uv.y - 0.5) * 2.0 * scale;
 
-    // Audio parameters
-    float freqStep = 11025.0 / 512.0;
-    float baseFreq = 40.0;
+    // Small offset for gradient calculation
+    float eps = 0.01 * scale;
 
-    // Accumulate field directly from audio - no intermediate arrays
-    float field = 0.0;
-    float totalEnergy = 0.0;
+    // Compute wave field at current position
+    float totalEnergy;
+    float u = computeWaveField(p, modeType, kappa, totalEnergy);
 
-    // For each mode (m,n), read audio at corresponding frequency and add contribution
-    // Use more modes for finer detail (shells.py uses up to 32)
-    for (int m = 0; m <= 20; m++) {
-        for (int n = 0; n <= 20; n++) {
-            if (m == 0 && n == 0) continue;
+    // Compute gradient using central differences
+    float dummy;
+    float u_px = computeWaveField(p + vec2(eps, 0.0), modeType, kappa, dummy);
+    float u_mx = computeWaveField(p - vec2(eps, 0.0), modeType, kappa, dummy);
+    float u_py = computeWaveField(p + vec2(0.0, eps), modeType, kappa, dummy);
+    float u_my = computeWaveField(p - vec2(0.0, eps), modeType, kappa, dummy);
 
-            // Mode radius determines its "frequency" in constant-Q space
-            float r = sqrt(float(m*m + n*n));
+    vec2 gradient = vec2(u_px - u_mx, u_py - u_my) / (2.0 * eps);
+    gradient *= gradientScale;
 
-            // Map mode to frequency: freq = baseFreq * 2^(s/4) where s = 4*log2(r)
-            // So freq = baseFreq * r
-            float freq = baseFreq * r;
-            if (freq > 8000.0) continue;
+    // Normalize by total energy
+    float normFactor = amplitude / max(sqrt(totalEnergy), 0.001);
+    u *= normFactor;
+    gradient *= normFactor;
 
-            // Read FFT at this frequency
-            // Shadertoy audio: 512 bins covering 0-11025 Hz
-            // Values are dB scaled: 0 = -100dB, 1 = -30dB
-            float u = freq / 11025.0;
-            float v = texture(iChannel0, vec2(u, 0.25)).x;
+    // Surface normal from gradient (wave acts as height field)
+    vec3 normal = normalize(vec3(-gradient.x, -gradient.y, 1.0));
 
-            // Convert from dB back to linear amplitude
-            // dB = -100 + v * 70, then amp = 10^(dB/20)
-            float dB = -100.0 + v * 70.0;
-            float amp = pow(10.0, dB / 20.0);
+    // Simulate a 3D view: eye looking down at slight angle
+    vec3 eye = normalize(vec3(uv.x - 0.5, uv.y - 0.5, -1.0));
 
-            // Apply kappa as gain (like log compression factor)
-            amp *= kappa * 2.0;
+    // Light from upper-right, slightly behind viewer
+    vec3 light = normalize(vec3(0.0, 1.0, 0.8));
 
-            if (amp < 0.001) continue;
+    // Distance from center (for attenuation effects)
+    float dist = length(p);
 
-            float kx = float(m) * PI;
-            float ky = float(n) * PI;
+    // Get surface color with full lighting model
+    vec3 color = getSurfaceColor(normal, light, eye, dist, u);
 
-            float mode_val;
-            if (modeType == 0) {
-                mode_val = cos(kx * p.x) * cos(ky * p.y);
-            } else if (modeType == 1) {
-                if (m == n) continue;
-                mode_val = cos(kx * p.x) * cos(ky * p.y);
-            } else {
-                mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);
-                if (m == n) mode_val *= 0.5;
-            }
+    // Apply gamma correction (linear to sRGB)
+    color = pow(color, vec3(0.65));
 
-            field += amp * mode_val;
-            totalEnergy += amp;
-        }
-
-
-    }
-
-    // Normalize
-    if (totalEnergy > 0.1) {
-        field /= sqrt(totalEnergy);
-    }
-
-    // Energy rendering
-    float I = field * field;
-    I = pow(I, 1.0 / contrast);
-    I = tanh(I * 2.0);
-
-    // Color mapping
-    vec3 color;
-    if (colorMode == 0) {
-        color = plasma(I);
-    } else if (colorMode == 1) {
-        color = magma(I);
-    } else if (colorMode == 2) {
-        color = turbo(I);
-    } else if (colorMode == 3) {
-        color = viridis(I);
-    } else {
-        color = vec3(I);
-    }
+    // Apply dithering to reduce banding
+    float dither = triangularNoise(fragCoord) / 255.0;
+    color += dither;
 
     fragColor = vec4(color, 1.0);
 }
-
-

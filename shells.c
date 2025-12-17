@@ -1,9 +1,15 @@
 /*
- * Spectral Shell Visualizer - Constant-Q Standing Wave Synthesis
+ * CQT Shell Visualizer - Constant-Q Transform Standing Wave Synthesis
  * Win32 C Port
  *
  * Standing wave visualizer with mirror symmetry about x and y axes.
  * Uses even-even cosine modes: cos(kx*x) * cos(ky*y)
+ *
+ * Constant-Q Transform (CQT):
+ *     - Frequency bins geometrically spaced (12 bins per octave = musical notes)
+ *     - Variable window lengths: longer for bass, shorter for treble
+ *     - Matches human perception of time-frequency tradeoff
+ *     - Great for: chords, key detection, melody tracking, harmonic analysis
  *
  * Build with:
  *   cl /O2 shells.c /link opengl32.lib user32.lib gdi32.lib ole32.lib
@@ -166,8 +172,16 @@ static void LoadGLExtensions(void) {
 #define MAX_BINS        (MAX_FFT_SIZE / 2 + 1)
 #define PI              3.14159265358979323846f
 
+/* CQT parameters */
+#define BINS_PER_OCTAVE 12      /* Musical: 12 semitones per octave */
+#define NUM_OCTAVES     8       /* C1 (~32 Hz) to B8 (~7902 Hz) */
+#define NUM_CQT_BINS    (BINS_PER_OCTAVE * NUM_OCTAVES)  /* 96 bins total */
+#define F_MIN           32.70f  /* C1 in Hz */
+
+/* Q_FACTOR = 1 / (2^(1/BINS_PER_OCTAVE) - 1) ~= 16.82 */
+#define Q_FACTOR        16.817154f
+
 #define MAX_MODES       2048
-#define MAX_SHELLS      64
 
 /* ============================================================================
  * Shaders
@@ -189,111 +203,129 @@ static const char *FRAGMENT_SHADER_SRC =
     "out vec4 outColor;\n"
     "\n"
     "uniform vec2 iResolution;\n"
-    "uniform sampler1D iShellAmps;\n"
-    "uniform sampler1D iModeData;\n"
+    "uniform sampler1D iCQTAmps;         // CQT bin amplitudes (96 bins = 8 octaves x 12 semitones)\n"
+    "uniform sampler1D iModeData;        // Packed mode data: (kx, ky, cqt_bin, inv_count)\n"
     "uniform int iNumModes;\n"
-    "uniform int iNumShells;\n"
+    "uniform int iNumCQTBins;\n"
     "uniform float iTime;\n"
-    "uniform int iColorMode;\n"
-    "uniform float iContrast;\n"
-    "uniform float iScale;\n"
-    "uniform int iModeType;\n"
+    "uniform float iScale;               // Spatial frequency scale\n"
+    "uniform int iModeType;              // 0=all, 1=m!=n only, 2=diagonal pairs\n"
+    "uniform float iTotalEnergy;         // Total energy for normalization\n"
+    "uniform float iAmplitude;           // Amplitude scaling factor\n"
     "\n"
     "#define PI 3.14159265\n"
-    "#define TAU 6.28318530\n"
     "\n"
     "// ============================================================================\n"
-    "// COLORMAPS\n"
+    "// DITHERING\n"
     "// ============================================================================\n"
     "\n"
-    "vec3 plasma(float t) {\n"
-    "    t = clamp(t, 0.0, 1.0);\n"
-    "    vec3 c0 = vec3(0.050383, 0.029803, 0.527975);\n"
-    "    vec3 c1 = vec3(0.417642, 0.000564, 0.658390);\n"
-    "    vec3 c2 = vec3(0.692840, 0.165141, 0.564522);\n"
-    "    vec3 c3 = vec3(0.881443, 0.392529, 0.383229);\n"
-    "    vec3 c4 = vec3(0.987622, 0.645320, 0.039886);\n"
-    "    vec3 c5 = vec3(0.940015, 0.975158, 0.131326);\n"
-    "    if (t >= 1.0) return c5;\n"
-    "    float s = t * 5.0;\n"
-    "    int idx = int(floor(s));\n"
-    "    float f = fract(s);\n"
-    "    if (idx == 0) return mix(c0, c1, f);\n"
-    "    if (idx == 1) return mix(c1, c2, f);\n"
-    "    if (idx == 2) return mix(c2, c3, f);\n"
-    "    if (idx == 3) return mix(c3, c4, f);\n"
-    "    return mix(c4, c5, f);\n"
+    "// Hash function for pseudo-random noise\n"
+    "float hash(vec2 p) {\n"
+    "    vec3 p3 = fract(vec3(p.xyx) * 0.1031);\n"
+    "    p3 += dot(p3, p3.yzx + 33.33);\n"
+    "    return fract((p3.x + p3.y) * p3.z);\n"
     "}\n"
     "\n"
-    "vec3 magma(float t) {\n"
-    "    t = clamp(t, 0.0, 1.0);\n"
-    "    vec3 c0 = vec3(0.001462, 0.000466, 0.013866);\n"
-    "    vec3 c1 = vec3(0.316654, 0.071862, 0.485380);\n"
-    "    vec3 c2 = vec3(0.716387, 0.214982, 0.474720);\n"
-    "    vec3 c3 = vec3(0.974417, 0.462840, 0.359756);\n"
-    "    vec3 c4 = vec3(0.995131, 0.766837, 0.534094);\n"
-    "    vec3 c5 = vec3(0.987053, 0.991438, 0.749504);\n"
-    "    if (t >= 1.0) return c5;\n"
-    "    float s = t * 5.0;\n"
-    "    int idx = int(floor(s));\n"
-    "    float f = fract(s);\n"
-    "    if (idx == 0) return mix(c0, c1, f);\n"
-    "    if (idx == 1) return mix(c1, c2, f);\n"
-    "    if (idx == 2) return mix(c2, c3, f);\n"
-    "    if (idx == 3) return mix(c3, c4, f);\n"
-    "    return mix(c4, c5, f);\n"
+    "// Triangular dithering noise (-0.5 to 0.5, triangular distribution)\n"
+    "float triangularNoise(vec2 p) {\n"
+    "    float r1 = hash(p);\n"
+    "    float r2 = hash(p + vec2(1.0, 0.0));\n"
+    "    return (r1 + r2) * 0.5 - 0.5;\n"
     "}\n"
     "\n"
-    "vec3 turbo(float t) {\n"
-    "    t = clamp(t, 0.0, 1.0);\n"
-    "    vec3 c0 = vec3(0.18995, 0.07176, 0.23217);\n"
-    "    vec3 c1 = vec3(0.25107, 0.25237, 0.63374);\n"
-    "    vec3 c2 = vec3(0.15992, 0.53830, 0.72889);\n"
-    "    vec3 c3 = vec3(0.09140, 0.74430, 0.54318);\n"
-    "    vec3 c4 = vec3(0.52876, 0.85393, 0.21546);\n"
-    "    vec3 c5 = vec3(0.88092, 0.73551, 0.07741);\n"
-    "    vec3 c6 = vec3(0.97131, 0.45935, 0.05765);\n"
-    "    vec3 c7 = vec3(0.84299, 0.15070, 0.15090);\n"
-    "    if (t >= 1.0) return c7;\n"
-    "    float s = t * 7.0;\n"
-    "    int idx = int(floor(s));\n"
-    "    float f = fract(s);\n"
-    "    if (idx == 0) return mix(c0, c1, f);\n"
-    "    if (idx == 1) return mix(c1, c2, f);\n"
-    "    if (idx == 2) return mix(c2, c3, f);\n"
-    "    if (idx == 3) return mix(c3, c4, f);\n"
-    "    if (idx == 4) return mix(c4, c5, f);\n"
-    "    if (idx == 5) return mix(c5, c6, f);\n"
-    "    return mix(c6, c7, f);\n"
+    "// ============================================================================\n"
+    "// WAVE FIELD COMPUTATION\n"
+    "// ============================================================================\n"
+    "\n"
+    "// Rendering parameters\n"
+    "const float gradientScale = 2.0;        // Scale for gradient calculation\n"
+    "\n"
+    "// Compute wave field value at position p (normalized by total energy)\n"
+    "float computeWaveField(vec2 p) {\n"
+    "    float u = 0.0;\n"
+    "    for (int i = 0; i < 2048; i++) {\n"
+    "        if (i >= iNumModes) break;\n"
+    "\n"
+    "        float texCoord = (float(i) + 0.5) / float(iNumModes);\n"
+    "        vec4 mode = texture(iModeData, texCoord);\n"
+    "\n"
+    "        float kx = mode.r;\n"
+    "        float ky = mode.g;\n"
+    "        int cqt_bin = int(mode.b);\n"
+    "        float inv_count = mode.a;\n"
+    "\n"
+    "        float cqtCoord = (float(cqt_bin) + 0.5) / float(iNumCQTBins);\n"
+    "        float A_s = texture(iCQTAmps, cqtCoord).r;\n"
+    "\n"
+    "        float mode_val;\n"
+    "        if (iModeType == 0) {\n"
+    "            mode_val = cos(kx * p.x) * cos(ky * p.y);\n"
+    "        } else if (iModeType == 1) {\n"
+    "            if (abs(kx - ky) < 0.01) continue;\n"
+    "            mode_val = cos(kx * p.x) * cos(ky * p.y);\n"
+    "        } else {\n"
+    "            mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);\n"
+    "            if (abs(kx - ky) < 0.01) mode_val *= 0.5;\n"
+    "        }\n"
+    "\n"
+    "        u += A_s * inv_count * mode_val;\n"
+    "    }\n"
+    "    // Normalize by total energy\n"
+    "    return u * iAmplitude / max(sqrt(iTotalEnergy), 0.001);\n"
     "}\n"
     "\n"
-    "vec3 viridis(float t) {\n"
-    "    t = clamp(t, 0.0, 1.0);\n"
-    "    vec3 c0 = vec3(0.267004, 0.004874, 0.329415);\n"
-    "    vec3 c1 = vec3(0.282327, 0.140926, 0.457517);\n"
-    "    vec3 c2 = vec3(0.253935, 0.265254, 0.529983);\n"
-    "    vec3 c3 = vec3(0.206756, 0.371758, 0.553117);\n"
-    "    vec3 c4 = vec3(0.143936, 0.522773, 0.556295);\n"
-    "    vec3 c5 = vec3(0.119512, 0.607464, 0.540218);\n"
-    "    vec3 c6 = vec3(0.166383, 0.690856, 0.496502);\n"
-    "    vec3 c7 = vec3(0.319809, 0.770914, 0.411152);\n"
-    "    vec3 c8 = vec3(0.525776, 0.833491, 0.288127);\n"
-    "    vec3 c9 = vec3(0.762373, 0.876424, 0.137064);\n"
-    "    vec3 c10 = vec3(0.993248, 0.906157, 0.143936);\n"
-    "    if (t >= 1.0) return c10;\n"
-    "    float s = t * 10.0;\n"
-    "    int idx = int(floor(s));\n"
-    "    float f = fract(s);\n"
-    "    if (idx == 0) return mix(c0, c1, f);\n"
-    "    if (idx == 1) return mix(c1, c2, f);\n"
-    "    if (idx == 2) return mix(c2, c3, f);\n"
-    "    if (idx == 3) return mix(c3, c4, f);\n"
-    "    if (idx == 4) return mix(c4, c5, f);\n"
-    "    if (idx == 5) return mix(c5, c6, f);\n"
-    "    if (idx == 6) return mix(c6, c7, f);\n"
-    "    if (idx == 7) return mix(c7, c8, f);\n"
-    "    if (idx == 8) return mix(c8, c9, f);\n"
-    "    return mix(c9, c10, f);\n"
+    "// ============================================================================\n"
+    "// LIGHTING\n"
+    "// ============================================================================\n"
+    "\n"
+    "// Night sky background\n"
+    "vec3 getSkyColor(vec3 rd) {\n"
+    "    float sd = dot(normalize(vec3(-0.5, -0.6, 0.9)), rd) * 0.5 + 0.5;\n"
+    "    sd = pow(sd, 5.0);\n"
+    "    vec3 col = mix(vec3(0.05, 0.1, 0.2), vec3(0.1, 0.05, 0.2), sd);\n"
+    "    return col * 0.63;\n"
+    "}\n"
+    "\n"
+    "// Soft diffuse lighting\n"
+    "float diffuse(vec3 n, vec3 l, float p) {\n"
+    "    return pow(dot(n, l) * 0.4 + 0.6, p);\n"
+    "}\n"
+    "\n"
+    "// Normalized specular (energy conserving)\n"
+    "float specularHighlight(vec3 n, vec3 l, vec3 e, float s) {\n"
+    "    float nrm = (s + 8.0) / (PI * 8.0);\n"
+    "    return pow(max(dot(reflect(e, n), l), 0.0), s) * nrm;\n"
+    "}\n"
+    "\n"
+    "// Surface color with height-based variation\n"
+    "vec3 getSurfaceColor(vec3 n, vec3 light, vec3 eye, float dist, float height) {\n"
+    "    // Fresnel: edges reflect more (cubic falloff, clamped)\n"
+    "    float fresnel = clamp(1.0 - dot(n, -eye), 0.0, 1.0);\n"
+    "    fresnel = min(pow(fresnel, 3.0), 0.5);\n"
+    "\n"
+    "    // Reflected sky\n"
+    "    vec3 reflected = getSkyColor(reflect(eye, n));\n"
+    "\n"
+    "    // Refracted/subsurface color - darker water for specular contrast\n"
+    "    vec3 baseColor = vec3(0.005, 0.01, 0.025);\n"
+    "    vec3 surfaceColor = vec3(0.05, 0.1, 0.15);\n"
+    "    vec3 refracted = baseColor + diffuse(n, light, 80.0) * surfaceColor * 0.05;\n"
+    "\n"
+    "    // Blend refracted and reflected based on fresnel\n"
+    "    vec3 color = mix(refracted, reflected, fresnel);\n"
+    "\n"
+    "    // Distance attenuation\n"
+    "    float atten = max(1.0 - dist * dist * 0.001, 0.0);\n"
+    "    color += surfaceColor * atten * 0.02;\n"
+    "\n"
+    "    // Height-based color - wave peaks glow brighter\n"
+    "    color += surfaceColor * height * 0.5 * atten;\n"
+    "\n"
+    "    // Specular with distance-dependent power (inversesqrt like Seascape)\n"
+    "    float specPower = 600.0 * inversesqrt(max(dist * dist, 0.01));\n"
+    "    color += vec3(0.8, 0.9, 1.0) * specularHighlight(n, light, eye, specPower) * 1.5;\n"
+    "\n"
+    "    return color;\n"
     "}\n"
     "\n"
     "// ============================================================================\n"
@@ -309,74 +341,56 @@ static const char *FRAGMENT_SHADER_SRC =
     "    p.x = (uv.x - 0.5) * 2.0 * aspect * iScale;\n"
     "    p.y = (uv.y - 0.5) * 2.0 * iScale;\n"
     "\n"
-    "    // Field synthesis: u(x,y,t) = Σ A_s / N_s * cos(kx*x) * cos(ky*y)\n"
-    "    float u = 0.0;\n"
+    "    // Small offset for gradient calculation (in normalized space)\n"
+    "    float eps = 0.01 * iScale;\n"
     "\n"
-    "    for (int i = 0; i < 2048; i++) {\n"
-    "        if (i >= iNumModes) break;\n"
+    "    // Compute wave field at current position\n"
+    "    float u = computeWaveField(p);\n"
     "\n"
-    "        // Fetch mode data: (kx, ky, shell, inv_count)\n"
-    "        float texCoord = (float(i) + 0.5) / float(iNumModes);\n"
-    "        vec4 mode = texture(iModeData, texCoord);\n"
+    "    // Compute gradient using central differences\n"
+    "    float u_px = computeWaveField(p + vec2(eps, 0.0));\n"
+    "    float u_mx = computeWaveField(p - vec2(eps, 0.0));\n"
+    "    float u_py = computeWaveField(p + vec2(0.0, eps));\n"
+    "    float u_my = computeWaveField(p - vec2(0.0, eps));\n"
     "\n"
-    "        float kx = mode.r;\n"
-    "        float ky = mode.g;\n"
-    "        int shell = int(mode.b);\n"
-    "        float inv_count = mode.a;\n"
+    "    vec2 gradient = vec2(u_px - u_mx, u_py - u_my) / (2.0 * eps);\n"
+    "    gradient *= gradientScale;\n"
     "\n"
-    "        // Get shell amplitude\n"
-    "        float shellCoord = (float(shell) + 0.5) / float(iNumShells);\n"
-    "        float A_s = texture(iShellAmps, shellCoord).r;\n"
+    "    // Surface normal from gradient (wave acts as height field)\n"
+    "    // Tilt slightly toward viewer for better 3D effect\n"
+    "    vec3 normal = normalize(vec3(-gradient.x, -gradient.y, 1.0));\n"
     "\n"
-    "        // Standing wave with x and y mirror symmetry\n"
-    "        float mode_val;\n"
+    "    // Simulate a 3D view: eye looking down at slight angle\n"
+    "    vec3 eye = normalize(vec3(uv.x - 0.5, uv.y - 0.5, -1.0));\n"
     "\n"
-    "        if (iModeType == 0) {\n"
-    "            // All modes: cos(kx*x) * cos(ky*y)\n"
-    "            mode_val = cos(kx * p.x) * cos(ky * p.y);\n"
-    "        } else if (iModeType == 1) {\n"
-    "            // Only m != n modes (skip when kx == ky)\n"
-    "            if (abs(kx - ky) < 0.01) continue;\n"
-    "            mode_val = cos(kx * p.x) * cos(ky * p.y);\n"
-    "        } else {\n"
-    "            // Diagonal symmetry: cos(kx*x)*cos(ky*y) + cos(ky*x)*cos(kx*y)\n"
-    "            mode_val = cos(kx * p.x) * cos(ky * p.y) + cos(ky * p.x) * cos(kx * p.y);\n"
-    "            if (abs(kx - ky) < 0.01) mode_val *= 0.5;\n"
-    "        }\n"
+    "    // Light from upper-right, slightly behind viewer\n"
+    "    vec3 light = normalize(vec3(0.0, 1.0, 0.8));\n"
     "\n"
-    "        u += A_s * inv_count * mode_val;\n"
-    "    }\n"
+    "    // Distance from center (for attenuation effects)\n"
+    "    float dist = length(p);\n"
     "\n"
-    "    // Energy rendering: I = u^2\n"
-    "    float I = u * u;\n"
+    "    // Get surface color with full lighting model\n"
+    "    vec3 color = getSurfaceColor(normal, light, eye, dist, u);\n"
     "\n"
-    "    // Apply contrast\n"
-    "    I = pow(I, 1.0 / iContrast);\n"
+    "    // Apply gamma correction (linear to sRGB)\n"
+    "    color = pow(color, vec3(0.65));\n"
     "\n"
-    "    // Soft clamp\n"
-    "    I = tanh(I * 2.0);\n"
-    "\n"
-    "    // Color mapping\n"
-    "    vec3 color;\n"
-    "    if (iColorMode == 0) {\n"
-    "        color = plasma(I);\n"
-    "    } else if (iColorMode == 1) {\n"
-    "        color = magma(I);\n"
-    "    } else if (iColorMode == 2) {\n"
-    "        color = turbo(I);\n"
-    "    } else if (iColorMode == 3) {\n"
-    "        color = viridis(I);\n"
-    "    } else {\n"
-    "        // Grayscale\n"
-    "        color = vec3(I);\n"
-    "    }\n"
+    "    // Apply dithering to reduce banding (+/-0.5/255 in each channel)\n"
+    "    float dither = triangularNoise(fragCoord) / 255.0;\n"
+    "    color += dither;\n"
     "\n"
     "    outColor = vec4(color, 1.0);\n"
     "}\n";
 
 /* ============================================================================
- * Audio Capture (WASAPI Loopback)
+ * Audio Capture (WASAPI Loopback) with CQT
  * ============================================================================ */
+
+typedef struct {
+    float *kernelReal;      /* Real part of CQT kernel */
+    float *kernelImag;      /* Imaginary part of CQT kernel */
+    int windowLen;          /* Window length for this bin */
+} CQTKernel;
 
 typedef struct {
     IAudioClient *pAudioClient;
@@ -389,63 +403,72 @@ typedef struct {
     float ringBuffer[MAX_FFT_SIZE * 4];
     volatile LONG writePos;
 
-    int fftSize;
-    float window[MAX_FFT_SIZE];
-    float spectrum[MAX_BINS];
-    float smoothSpectrum[MAX_BINS];
+    /* CQT kernels */
+    CQTKernel cqtKernels[NUM_CQT_BINS];
+    float cqtFreqs[NUM_CQT_BINS];
+    int cqtWindowLens[NUM_CQT_BINS];
+
+    /* Output */
+    float cqtOutput[NUM_CQT_BINS];
     float runningMax;
-    float output[MAX_BINS];
 
     CRITICAL_SECTION cs;
 } AudioCapture;
 
 static AudioCapture g_audio;
 
-/* Simple radix-2 FFT - Cooley-Tukey algorithm */
-static void fft_complex(float *real, float *imag, int n) {
-    int i, j, k;
-    for (i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1)
-            j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            float tr = real[i], ti = imag[i];
-            real[i] = real[j]; imag[i] = imag[j];
-            real[j] = tr; imag[j] = ti;
+static void AudioInitCQTKernels(AudioCapture *a) {
+    /* Precompute CQT analysis kernels for each frequency bin.
+     *
+     * For each bin k:
+     *     f_k = f_min * 2^(k/bins_per_octave)
+     *     N_k = ceil(Q * fs / f_k)  -- Window length (longer for low freq)
+     *     kernel_k = window(N_k) * exp(-2*pi*i * Q * n / N_k)
+     */
+
+    int maxWindow = 0;
+    int minWindow = MAX_FFT_SIZE;
+
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        /* Center frequency for this bin */
+        float freq = F_MIN * powf(2.0f, (float)k / BINS_PER_OCTAVE);
+        a->cqtFreqs[k] = freq;
+
+        /* Window length: N_k = Q * fs / f_k */
+        int N_k = (int)ceilf(Q_FACTOR * SAMPLE_RATE / freq);
+        if (N_k > MAX_FFT_SIZE) N_k = MAX_FFT_SIZE;
+        a->cqtWindowLens[k] = N_k;
+        a->cqtKernels[k].windowLen = N_k;
+
+        if (N_k > maxWindow) maxWindow = N_k;
+        if (N_k < minWindow) minWindow = N_k;
+
+        /* Allocate kernel */
+        a->cqtKernels[k].kernelReal = (float *)malloc(N_k * sizeof(float));
+        a->cqtKernels[k].kernelImag = (float *)malloc(N_k * sizeof(float));
+
+        /* Complex exponential kernel with Hann window */
+        for (int n = 0; n < N_k; n++) {
+            float window = 0.5f - 0.5f * cosf(2.0f * PI * n / N_k);  /* Hann window */
+            float angle = -2.0f * PI * Q_FACTOR * n / N_k;
+            a->cqtKernels[k].kernelReal[n] = window * cosf(angle) / N_k;
+            a->cqtKernels[k].kernelImag[n] = window * sinf(angle) / N_k;
         }
     }
 
-    for (int len = 2; len <= n; len <<= 1) {
-        float angle = -2.0f * PI / len;
-        float wpr = cosf(angle);
-        float wpi = sinf(angle);
-        for (i = 0; i < n; i += len) {
-            float wr = 1.0f, wi = 0.0f;
-            for (j = 0; j < len / 2; j++) {
-                int u = i + j;
-                int v = i + j + len / 2;
-                float tr = wr * real[v] - wi * imag[v];
-                float ti = wr * imag[v] + wi * real[v];
-                real[v] = real[u] - tr;
-                imag[v] = imag[u] - ti;
-                real[u] += tr;
-                imag[u] += ti;
-                float wt = wr;
-                wr = wr * wpr - wi * wpi;
-                wi = wt * wpi + wi * wpr;
-            }
-        }
-    }
+    printf("CQT initialized: %d bins, %d/octave\n", NUM_CQT_BINS, BINS_PER_OCTAVE);
+    printf("  Freq range: %.1f Hz - %.1f Hz\n", a->cqtFreqs[0], a->cqtFreqs[NUM_CQT_BINS - 1]);
+    printf("  Window range: %d - %d samples\n", minWindow, maxWindow);
+    printf("  Time resolution: %.1f - %.1f ms\n",
+           (float)minWindow / SAMPLE_RATE * 1000.0f,
+           (float)maxWindow / SAMPLE_RATE * 1000.0f);
 }
 
-static void AudioUpdateFFTParams(AudioCapture *a) {
-    for (int i = 0; i < a->fftSize; i++) {
-        a->window[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (a->fftSize - 1)));
+static void AudioFreeCQTKernels(AudioCapture *a) {
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        if (a->cqtKernels[k].kernelReal) free(a->cqtKernels[k].kernelReal);
+        if (a->cqtKernels[k].kernelImag) free(a->cqtKernels[k].kernelImag);
     }
-    memset(a->spectrum, 0, sizeof(a->spectrum));
-    memset(a->smoothSpectrum, 0, sizeof(a->smoothSpectrum));
-    a->runningMax = 0.01f;
 }
 
 static DWORD WINAPI AudioCaptureThread(LPVOID param) {
@@ -523,17 +546,18 @@ static DWORD WINAPI AudioCaptureThread(LPVOID param) {
     return 0;
 }
 
-static BOOL AudioInit(AudioCapture *a, int fftSize) {
+static BOOL AudioInit(AudioCapture *a) {
     HRESULT hr;
     IMMDeviceEnumerator *pEnumerator = NULL;
     IMMDevice *pDevice = NULL;
 
     memset(a, 0, sizeof(*a));
-    a->fftSize = fftSize;
     a->runningMax = 0.01f;
     a->paused = FALSE;
     InitializeCriticalSection(&a->cs);
-    AudioUpdateFFTParams(a);
+
+    /* Initialize CQT kernels */
+    AudioInitCQTKernels(a);
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
@@ -605,191 +629,183 @@ static void AudioStop(AudioCapture *a) {
     if (a->pCaptureClient) IAudioCaptureClient_Release(a->pCaptureClient);
     if (a->pAudioClient) IAudioClient_Release(a->pAudioClient);
     if (a->pwfx) CoTaskMemFree(a->pwfx);
+    AudioFreeCQTKernels(a);
     DeleteCriticalSection(&a->cs);
 }
 
-static void AudioSetFFTSize(AudioCapture *a, int size) {
-    if (size < 256) size = 256;
-    if (size > MAX_FFT_SIZE) size = MAX_FFT_SIZE;
-    if (size != a->fftSize) {
-        EnterCriticalSection(&a->cs);
-        a->fftSize = size;
-        AudioUpdateFFTParams(a);
-        LeaveCriticalSection(&a->cs);
-    }
-}
-
-static float *AudioGetData(AudioCapture *a) {
-    static float fftReal[MAX_FFT_SIZE];
-    static float fftImag[MAX_FFT_SIZE];
-
-    int fftSize = a->fftSize;
-    int nBins = fftSize / 2 + 1;
+static float *AudioGetCQT(AudioCapture *a) {
+    /* Compute Constant-Q Transform using precomputed kernels.
+     *
+     * Each bin uses a different window length, providing:
+     * - Better frequency resolution for bass (long windows)
+     * - Better time resolution for treble (short windows)
+     */
     int bufLen = MAX_FFT_SIZE * 4;
 
     EnterCriticalSection(&a->cs);
     int currentPos = a->writePos;
-    int start = (currentPos - fftSize + bufLen) % bufLen;
-
-    for (int i = 0; i < fftSize; i++) {
-        int idx = (start + i) % bufLen;
-        fftReal[i] = a->ringBuffer[idx] * a->window[i];
-        fftImag[i] = 0.0f;
-    }
     LeaveCriticalSection(&a->cs);
 
-    fft_complex(fftReal, fftImag, fftSize);
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        int N_k = a->cqtKernels[k].windowLen;
+        float *kernelReal = a->cqtKernels[k].kernelReal;
+        float *kernelImag = a->cqtKernels[k].kernelImag;
 
-    for (int i = 0; i < nBins; i++) {
-        a->spectrum[i] = sqrtf(fftReal[i] * fftReal[i] + fftImag[i] * fftImag[i]);
-    }
+        /* Extract samples for this bin's window length */
+        int start = (currentPos - N_k + bufLen) % bufLen;
 
-    float currentMax = 0.0f;
-    for (int i = 0; i < nBins; i++) {
-        if (a->spectrum[i] > currentMax) currentMax = a->spectrum[i];
-    }
+        /* Convolve with kernel (dot product for matched frequency) */
+        float sumReal = 0.0f;
+        float sumImag = 0.0f;
 
-    if (currentMax > a->runningMax) {
-        a->runningMax = currentMax;
-    } else {
-        a->runningMax = a->runningMax * 0.995f;
-        if (a->runningMax < currentMax) a->runningMax = currentMax;
-        if (a->runningMax < 0.01f) a->runningMax = 0.01f;
-    }
-
-    for (int i = 0; i < nBins; i++) {
-        float normalized = a->spectrum[i] / (a->runningMax + 1e-6f);
-        if (normalized > 1.5f) normalized = 1.5f;
-        if (normalized < 0.0f) normalized = 0.0f;
-
-        if (normalized > a->smoothSpectrum[i]) {
-            a->smoothSpectrum[i] = normalized;
-        } else {
-            a->smoothSpectrum[i] = a->smoothSpectrum[i] * 0.85f + normalized * 0.15f;
+        EnterCriticalSection(&a->cs);
+        for (int n = 0; n < N_k; n++) {
+            int idx = (start + n) % bufLen;
+            float sample = a->ringBuffer[idx];
+            sumReal += sample * kernelReal[n];
+            sumImag += sample * kernelImag[n];
         }
+        LeaveCriticalSection(&a->cs);
+
+        a->cqtOutput[k] = sqrtf(sumReal * sumReal + sumImag * sumImag);
     }
 
-    memset(a->output, 0, sizeof(a->output));
-    for (int i = 0; i < nBins; i++) {
-        a->output[i] = a->smoothSpectrum[i];
+    /* Adaptive normalization with slower response and much higher floor
+     * This prevents over-saturation at loud volumes */
+    float currentMax = 0.0f;
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        if (a->cqtOutput[k] > currentMax) currentMax = a->cqtOutput[k];
     }
 
-    return a->output;
+    /* Slow attack (don't jump up instantly), slower release */
+    if (currentMax > a->runningMax) {
+        /* Very slow attack */
+        a->runningMax += 0.01f * (currentMax - a->runningMax);
+    } else {
+        /* Very slow release */
+        a->runningMax = a->runningMax * 0.999f;
+        if (a->runningMax < currentMax) a->runningMax = currentMax;
+        if (a->runningMax < 0.0001f) a->runningMax = 0.0001f;
+    }
+
+    /* Use much higher reference point to leave lots of headroom
+     * 5x headroom means normal volume sits around 20% amplitude */
+    float reference = a->runningMax * 5.0f + 0.0001f;
+
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        float normalized = a->cqtOutput[k] / reference;
+        if (normalized > 1.0f) normalized = 1.0f;
+        if (normalized < 0.0f) normalized = 0.0f;
+        a->cqtOutput[k] = normalized;
+    }
+
+    return a->cqtOutput;
 }
 
 /* ============================================================================
- * Shell Processor - Constant-Q mode mapping
+ * CQT Processor - Maps CQT bins to spatial modes
  * ============================================================================ */
 
 typedef struct {
     int numModes;
-    int numShells;
     float kappa;
     float tauAttack;
     float tauRelease;
 
-    float modeData[MAX_MODES * 4];  /* (kx, ky, shell, inv_count) */
-    int shellCounts[MAX_SHELLS];
-    float shellAmps[MAX_SHELLS];
+    float modeData[MAX_MODES * 4];  /* (kx, ky, cqt_bin, inv_count) */
+    float cqtAmps[NUM_CQT_BINS];
 
     LARGE_INTEGER lastTime;
     LARGE_INTEGER freq;
-} ShellProcessor;
+} CQTProcessor;
 
-static ShellProcessor g_shell;
+static CQTProcessor g_cqt;
 
-static int BinToShell(int binIdx, int nBins, float freqPerBin) {
-    float freq = binIdx * freqPerBin;
-    if (freq < 20.0f) return -1;
+/* Semitone patterns for the 12 notes (gives visual variety) */
+static const int semitone_patterns[12][2] = {
+    {1, 0},   /* C  - horizontal */
+    {1, 1},   /* C# - diagonal */
+    {0, 1},   /* D  - vertical */
+    {2, 1},   /* D# - angled */
+    {1, 2},   /* E  - angled other way */
+    {2, 0},   /* F  - horizontal 2nd harmonic */
+    {2, 2},   /* F# - diagonal 2nd */
+    {0, 2},   /* G  - vertical 2nd */
+    {3, 1},   /* G# - complex */
+    {1, 3},   /* A  - complex other */
+    {3, 2},   /* A# - complex */
+    {2, 3},   /* B  - complex other */
+};
 
-    float baseFreq = 40.0f;
-    float r = freq / baseFreq;
-    if (r < 1.0f) return -1;
+static void CQTProcessorInit(CQTProcessor *cp) {
+    memset(cp, 0, sizeof(*cp));
+    cp->kappa = 1.0f;           /* Lower = more dynamic range */
+    cp->tauAttack = 0.040f;
+    cp->tauRelease = 0.300f;
 
-    int s = (int)floorf(4.0f * log2f(r));
-    return (s < MAX_SHELLS) ? s : MAX_SHELLS - 1;
-}
+    QueryPerformanceFrequency(&cp->freq);
+    QueryPerformanceCounter(&cp->lastTime);
 
-static void ShellInit(ShellProcessor *sp) {
-    memset(sp, 0, sizeof(*sp));
-    sp->numShells = MAX_SHELLS;
-    sp->kappa = 5.0f;
-    sp->tauAttack = 0.040f;
-    sp->tauRelease = 0.300f;
-
-    QueryPerformanceFrequency(&sp->freq);
-    QueryPerformanceCounter(&sp->lastTime);
-
-    /* Generate modes */
+    /* Generate modes - one per CQT bin
+     * Much simpler mapping: each musical note gets ONE distinct spatial mode.
+     * Lower notes = lower spatial frequency, higher notes = higher spatial frequency.
+     */
     int modeIdx = 0;
-    int maxMN = 32;
 
-    for (int m = 0; m <= maxMN; m++) {
-        for (int n = 0; n <= maxMN; n++) {
-            if (m == 0 && n == 0) continue;  /* Skip DC */
-            if (modeIdx >= MAX_MODES) break;
+    for (int k = 0; k < NUM_CQT_BINS && modeIdx < MAX_MODES; k++) {
+        int octave = k / BINS_PER_OCTAVE;     /* 0-7 */
+        int semitone = k % BINS_PER_OCTAVE;   /* 0-11 */
 
-            float r = sqrtf((float)(m*m + n*n));
-            int s = (int)floorf(4.0f * log2f(r));
-            if (s < 0 || s >= MAX_SHELLS) continue;
+        /* Base spatial frequency scales with octave (doubles each octave) */
+        float base_freq = powf(2.0f, octave / 2.0f);  /* Slower growth for visibility */
 
-            float kx = m * PI;
-            float ky = n * PI;
+        /* Get pattern for this semitone */
+        int m_base = semitone_patterns[semitone][0];
+        int n_base = semitone_patterns[semitone][1];
 
-            sp->modeData[modeIdx * 4 + 0] = kx;
-            sp->modeData[modeIdx * 4 + 1] = ky;
-            sp->modeData[modeIdx * 4 + 2] = (float)s;
-            sp->modeData[modeIdx * 4 + 3] = 0.0f;  /* Will set inv_count later */
-            sp->shellCounts[s]++;
-            modeIdx++;
-        }
-        if (modeIdx >= MAX_MODES) break;
+        /* Scale by octave */
+        int m = (int)(m_base * base_freq);
+        int n = (int)(n_base * base_freq);
+        if (m < 1 && m_base > 0) m = 1;
+        if (n < 0) n = 0;
+
+        /* Ensure we don't have (0,0) */
+        if (m == 0 && n == 0) m = 1;
+
+        float kx = m * PI;
+        float ky = n * PI;
+
+        cp->modeData[modeIdx * 4 + 0] = kx;
+        cp->modeData[modeIdx * 4 + 1] = ky;
+        cp->modeData[modeIdx * 4 + 2] = (float)k;   /* CQT bin index */
+        cp->modeData[modeIdx * 4 + 3] = 1.0f;       /* Each bin has exactly one mode */
+        modeIdx++;
     }
-    sp->numModes = modeIdx;
+    cp->numModes = modeIdx;
 
-    /* Set inverse counts */
-    for (int i = 0; i < sp->numModes; i++) {
-        int s = (int)sp->modeData[i * 4 + 2];
-        float invCount = 1.0f / (float)(sp->shellCounts[s] > 0 ? sp->shellCounts[s] : 1);
-        sp->modeData[i * 4 + 3] = invCount;
-    }
-
-    int activeShells = 0;
-    for (int i = 0; i < MAX_SHELLS; i++) {
-        if (sp->shellCounts[i] > 0) activeShells++;
-    }
-
-    printf("Initialized %d modes across %d active shells\n", sp->numModes, activeShells);
+    printf("Simple mode mapping: %d modes (1 per CQT bin)\n", cp->numModes);
 }
 
-static void ShellProcess(ShellProcessor *sp, float *spectrum, int nBins, int fftSize) {
+static void CQTProcessorProcess(CQTProcessor *cp, float *cqtSpectrum) {
+    /* Process CQT spectrum into smoothed amplitudes with attack/release dynamics */
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    float dt = (float)(now.QuadPart - sp->lastTime.QuadPart) / (float)sp->freq.QuadPart;
-    sp->lastTime = now;
+    float dt = (float)(now.QuadPart - cp->lastTime.QuadPart) / (float)cp->freq.QuadPart;
+    cp->lastTime = now;
 
-    float freqPerBin = (float)SAMPLE_RATE / fftSize;
+    /* Attack/release smoothing */
+    float alphaAttack = 1.0f - expf(-dt / cp->tauAttack);
+    float alphaRelease = 1.0f - expf(-dt / cp->tauRelease);
 
-    /* Compute raw shell energies */
-    float shellEnergyRaw[MAX_SHELLS] = {0};
-    for (int i = 1; i < nBins; i++) {
-        int s = BinToShell(i, nBins, freqPerBin);
-        if (s >= 0 && s < MAX_SHELLS) {
-            shellEnergyRaw[s] += spectrum[i] * spectrum[i];
-        }
-    }
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        /* Log compression: E_k = log(1 + kappa * spectrum^2) */
+        float E_k = logf(1.0f + cp->kappa * cqtSpectrum[k] * cqtSpectrum[k]);
 
-    /* Log compression and attack/release smoothing */
-    float alphaAttack = 1.0f - expf(-dt / sp->tauAttack);
-    float alphaRelease = 1.0f - expf(-dt / sp->tauRelease);
-
-    for (int s = 0; s < MAX_SHELLS; s++) {
-        float E_s = logf(1.0f + sp->kappa * shellEnergyRaw[s]);
-
-        if (E_s > sp->shellAmps[s]) {
-            sp->shellAmps[s] += alphaAttack * (E_s - sp->shellAmps[s]);
+        /* A_k <- A_k + alpha * (E_k - A_k) */
+        if (E_k > cp->cqtAmps[k]) {
+            cp->cqtAmps[k] += alphaAttack * (E_k - cp->cqtAmps[k]);
         } else {
-            sp->shellAmps[s] += alphaRelease * (E_s - sp->shellAmps[s]);
+            cp->cqtAmps[k] += alphaRelease * (E_k - cp->cqtAmps[k]);
         }
     }
 }
@@ -798,41 +814,39 @@ static void ShellProcess(ShellProcessor *sp, float *spectrum, int nBins, int fft
  * Visualizer
  * ============================================================================ */
 
-#define DEFAULT_CONTRAST     1.5f
-#define DEFAULT_SCALE        1.0f
-#define DEFAULT_COLOR_MODE   0
+#define DEFAULT_SCALE        0.5f
+#define DEFAULT_KAPPA        1.0f
+#define DEFAULT_TAU_ATTACK   0.040f
+#define DEFAULT_TAU_RELEASE  0.300f
+#define DEFAULT_AMPLITUDE    0.1f
 #define DEFAULT_MODE_TYPE    0
-#define DEFAULT_FFT_SIZE     8192
 
-#define NUM_COLOR_MODES      5
 #define NUM_MODE_TYPES       3
 
-static const char *COLOR_NAMES[] = {"Plasma", "Magma", "Turbo", "Viridis", "Grayscale"};
 static const char *MODE_TYPE_NAMES[] = {"All", "m!=n", "Diagonal"};
 
 typedef struct {
     int w, h;
-    float contrast;
     float scale;
-    int colorMode;
     int modeType;
+    float amplitude;
     float time;
 
     GLuint program;
     GLuint vao;
-    GLuint shellTex;
+    GLuint cqtTex;
     GLuint modeTex;
 
     GLint locResolution;
-    GLint locShellAmps;
+    GLint locCQTAmps;
     GLint locModeData;
     GLint locNumModes;
-    GLint locNumShells;
+    GLint locNumCQTBins;
     GLint locTime;
-    GLint locColorMode;
-    GLint locContrast;
     GLint locScale;
     GLint locModeType;
+    GLint locTotalEnergy;
+    GLint locAmplitude;
 } Visualizer;
 
 static Visualizer g_viz;
@@ -854,13 +868,12 @@ static GLuint CompileShader(GLenum type, const char *source) {
 }
 
 static void VizResetDefaults(Visualizer *v) {
-    v->contrast = DEFAULT_CONTRAST;
     v->scale = DEFAULT_SCALE;
-    v->colorMode = DEFAULT_COLOR_MODE;
     v->modeType = DEFAULT_MODE_TYPE;
+    v->amplitude = DEFAULT_AMPLITUDE;
 }
 
-static BOOL VizInit(Visualizer *v, int w, int h, ShellProcessor *sp) {
+static BOOL VizInit(Visualizer *v, int w, int h, CQTProcessor *cp) {
     v->w = w;
     v->h = h;
     v->time = 0.0f;
@@ -903,59 +916,65 @@ static BOOL VizInit(Visualizer *v, int w, int h, ShellProcessor *sp) {
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
     glEnableVertexAttribArray(0);
 
-    /* 1D texture for shell amplitudes */
-    glGenTextures(1, &v->shellTex);
-    glBindTexture(GL_TEXTURE_1D, v->shellTex);
+    /* 1D texture for CQT amplitudes (96 bins) */
+    glGenTextures(1, &v->cqtTex);
+    glBindTexture(GL_TEXTURE_1D, v->cqtTex);
     glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, MAX_SHELLS, 0, GL_RED, GL_FLOAT, NULL);
+    glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, NUM_CQT_BINS, 0, GL_RED, GL_FLOAT, NULL);
 
-    /* 1D texture for mode data */
+    /* 1D texture for mode data (RGBA: kx, ky, cqt_bin, inv_count) */
     glGenTextures(1, &v->modeTex);
     glBindTexture(GL_TEXTURE_1D, v->modeTex);
     glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA32F, sp->numModes, 0, GL_RGBA, GL_FLOAT, sp->modeData);
+    glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA32F, cp->numModes, 0, GL_RGBA, GL_FLOAT, cp->modeData);
 
     v->locResolution = glGetUniformLocation(v->program, "iResolution");
-    v->locShellAmps = glGetUniformLocation(v->program, "iShellAmps");
+    v->locCQTAmps = glGetUniformLocation(v->program, "iCQTAmps");
     v->locModeData = glGetUniformLocation(v->program, "iModeData");
     v->locNumModes = glGetUniformLocation(v->program, "iNumModes");
-    v->locNumShells = glGetUniformLocation(v->program, "iNumShells");
+    v->locNumCQTBins = glGetUniformLocation(v->program, "iNumCQTBins");
     v->locTime = glGetUniformLocation(v->program, "iTime");
-    v->locColorMode = glGetUniformLocation(v->program, "iColorMode");
-    v->locContrast = glGetUniformLocation(v->program, "iContrast");
     v->locScale = glGetUniformLocation(v->program, "iScale");
     v->locModeType = glGetUniformLocation(v->program, "iModeType");
+    v->locTotalEnergy = glGetUniformLocation(v->program, "iTotalEnergy");
+    v->locAmplitude = glGetUniformLocation(v->program, "iAmplitude");
 
     return TRUE;
 }
 
-static void VizRender(Visualizer *v, ShellProcessor *sp, float dt) {
+static void VizRender(Visualizer *v, CQTProcessor *cp, float dt) {
     v->time += dt;
 
-    /* Update shell amplitudes texture */
-    glBindTexture(GL_TEXTURE_1D, v->shellTex);
-    glTexSubImage1D(GL_TEXTURE_1D, 0, 0, MAX_SHELLS, GL_RED, GL_FLOAT, sp->shellAmps);
+    /* Compute total energy (sum of squared amplitudes) */
+    float totalEnergy = 0.0f;
+    for (int k = 0; k < NUM_CQT_BINS; k++) {
+        totalEnergy += cp->cqtAmps[k] * cp->cqtAmps[k];
+    }
+
+    /* Update CQT amplitudes texture */
+    glBindTexture(GL_TEXTURE_1D, v->cqtTex);
+    glTexSubImage1D(GL_TEXTURE_1D, 0, 0, NUM_CQT_BINS, GL_RED, GL_FLOAT, cp->cqtAmps);
 
     glViewport(0, 0, v->w, v->h);
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(v->program);
     glUniform2f(v->locResolution, (float)v->w, (float)v->h);
-    glUniform1i(v->locNumModes, sp->numModes);
-    glUniform1i(v->locNumShells, MAX_SHELLS);
+    glUniform1i(v->locNumModes, cp->numModes);
+    glUniform1i(v->locNumCQTBins, NUM_CQT_BINS);
     glUniform1f(v->locTime, v->time);
-    glUniform1i(v->locColorMode, v->colorMode);
-    glUniform1f(v->locContrast, v->contrast);
     glUniform1f(v->locScale, v->scale);
     glUniform1i(v->locModeType, v->modeType);
+    glUniform1f(v->locTotalEnergy, totalEnergy);
+    glUniform1f(v->locAmplitude, v->amplitude);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_1D, v->shellTex);
-    glUniform1i(v->locShellAmps, 0);
+    glBindTexture(GL_TEXTURE_1D, v->cqtTex);
+    glUniform1i(v->locCQTAmps, 0);
 
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_1D, v->modeTex);
@@ -965,14 +984,14 @@ static void VizRender(Visualizer *v, ShellProcessor *sp, float dt) {
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, NULL);
 }
 
-static void PrintStatus(Visualizer *v, ShellProcessor *sp, int fftSize) {
+static void PrintStatus(Visualizer *v, CQTProcessor *cp) {
     char status[256];
     snprintf(status, sizeof(status),
-             "Scale=%.2f  Contrast=%.1f  Kappa=%.1f  Attack=%.0fms  Release=%.0fms  Mode=%s  Color=%s  FFT=%d",
-             v->scale, v->contrast, sp->kappa,
-             sp->tauAttack * 1000.0f, sp->tauRelease * 1000.0f,
-             MODE_TYPE_NAMES[v->modeType], COLOR_NAMES[v->colorMode], fftSize);
-    printf("\r%-140s", status);
+             "Scale=%.2f  Amp=%.2f  Kappa=%.1f  Attack=%.0fms  Release=%.0fms  Mode=%s",
+             v->scale, v->amplitude, cp->kappa,
+             cp->tauAttack * 1000.0f, cp->tauRelease * 1000.0f,
+             MODE_TYPE_NAMES[v->modeType]);
+    printf("\r%-100s", status);
     fflush(stdout);
 }
 
@@ -1072,7 +1091,7 @@ static BOOL CreateOpenGLContext(int w, int h) {
     int winW = rect.right - rect.left;
     int winH = rect.bottom - rect.top;
 
-    g_hwnd = CreateWindow("ShellsClass", "Spectral Shell Visualizer", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_hwnd = CreateWindow("ShellsClass", "CQT Shell Visualizer", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                           (screenW - winW) / 2, (screenH - winH) / 2, winW, winH,
                           NULL, NULL, wc.hInstance, NULL);
     if (!g_hwnd) return FALSE;
@@ -1124,15 +1143,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    ShellInit(&g_shell);
+    CQTProcessorInit(&g_cqt);
 
-    if (!VizInit(&g_viz, winW, winH, &g_shell)) {
+    if (!VizInit(&g_viz, winW, winH, &g_cqt)) {
         printf("Failed to initialize visualizer\n");
         DestroyOpenGLContext();
         return 1;
     }
 
-    if (!AudioInit(&g_audio, DEFAULT_FFT_SIZE)) {
+    if (!AudioInit(&g_audio)) {
         printf("Failed to initialize audio capture\n");
         DestroyOpenGLContext();
         return 1;
@@ -1140,16 +1159,16 @@ int main(int argc, char *argv[]) {
 
     Sleep(50);
 
-    printf("Spectral Shell Visualizer - Constant-Q Standing Wave Synthesis\n");
-    printf("Controls: W/S=scale  Z/X=contrast  K/L=kappa  UP/DOWN=attack  LEFT/RIGHT=release\n");
-    printf("          M=mode type  V=color  F=FFT size  ALT+ENTER=fullscreen  SPACE=reset  ESC=quit\n\n");
+    printf("CQT Shell Visualizer - Constant-Q Transform Standing Wave Synthesis\n");
+    printf("Controls: W/S=scale  Z/X=amplitude  K/L=kappa  UP/DOWN=attack  LEFT/RIGHT=release\n");
+    printf("          M=mode  ALT+ENTER=fullscreen  SPACE=reset  ESC=quit\n\n");
 
-    PrintStatus(&g_viz, &g_shell, g_audio.fftSize);
+    PrintStatus(&g_viz, &g_cqt);
 
     BOOL running = TRUE;
     DWORD lastKeyTime = 0;
     DWORD repeatDelay = 100;
-    BOOL prevF = FALSE, prevM = FALSE, prevV = FALSE, prevSpace = FALSE;
+    BOOL prevM = FALSE, prevSpace = FALSE;
     BOOL prevAltEnter = FALSE;
 
     LARGE_INTEGER perfFreq, lastTime, nowTime;
@@ -1206,71 +1225,61 @@ int main(int argc, char *argv[]) {
                 lastKeyTime = now;
             }
 
-            /* Contrast Z/X */
+            /* Amplitude Z/X */
             if ((GetAsyncKeyState('X') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.contrast += 0.1f;
-                if (g_viz.contrast > 5.0f) g_viz.contrast = 5.0f;
+                g_viz.amplitude *= 1.2f;
+                if (g_viz.amplitude > 5.0f) g_viz.amplitude = 5.0f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
             if ((GetAsyncKeyState('Z') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_viz.contrast -= 0.1f;
-                if (g_viz.contrast < 0.1f) g_viz.contrast = 0.1f;
+                g_viz.amplitude /= 1.2f;
+                if (g_viz.amplitude < 0.01f) g_viz.amplitude = 0.01f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
 
             /* Kappa K/L */
             if ((GetAsyncKeyState('L') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_shell.kappa *= 1.2f;
-                if (g_shell.kappa > 50.0f) g_shell.kappa = 50.0f;
+                g_cqt.kappa *= 1.2f;
+                if (g_cqt.kappa > 50.0f) g_cqt.kappa = 50.0f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
             if ((GetAsyncKeyState('K') & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_shell.kappa /= 1.2f;
-                if (g_shell.kappa < 0.1f) g_shell.kappa = 0.1f;
+                g_cqt.kappa /= 1.2f;
+                if (g_cqt.kappa < 0.1f) g_cqt.kappa = 0.1f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
 
             /* Attack UP/DOWN */
             if ((GetAsyncKeyState(VK_UP) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_shell.tauAttack *= 1.2f;
-                if (g_shell.tauAttack > 0.5f) g_shell.tauAttack = 0.5f;
+                g_cqt.tauAttack *= 1.2f;
+                if (g_cqt.tauAttack > 0.5f) g_cqt.tauAttack = 0.5f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
             if ((GetAsyncKeyState(VK_DOWN) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_shell.tauAttack /= 1.2f;
-                if (g_shell.tauAttack < 0.001f) g_shell.tauAttack = 0.001f;
+                g_cqt.tauAttack /= 1.2f;
+                if (g_cqt.tauAttack < 0.001f) g_cqt.tauAttack = 0.001f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
 
             /* Release LEFT/RIGHT */
             if ((GetAsyncKeyState(VK_RIGHT) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_shell.tauRelease *= 1.2f;
-                if (g_shell.tauRelease > 2.0f) g_shell.tauRelease = 2.0f;
+                g_cqt.tauRelease *= 1.2f;
+                if (g_cqt.tauRelease > 2.0f) g_cqt.tauRelease = 2.0f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
             if ((GetAsyncKeyState(VK_LEFT) & 0x8000) && (now - lastKeyTime >= repeatDelay)) {
-                g_shell.tauRelease /= 1.2f;
-                if (g_shell.tauRelease < 0.01f) g_shell.tauRelease = 0.01f;
+                g_cqt.tauRelease /= 1.2f;
+                if (g_cqt.tauRelease < 0.01f) g_cqt.tauRelease = 0.01f;
                 needUpdate = TRUE;
                 lastKeyTime = now;
             }
-
-            /* FFT size F (edge-triggered) */
-            BOOL currF = (GetAsyncKeyState('F') & 0x8000) != 0;
-            if (currF && !prevF) {
-                int newSize = g_audio.fftSize * 2;
-                if (newSize > MAX_FFT_SIZE) newSize = 256;
-                AudioSetFFTSize(&g_audio, newSize);
-                needUpdate = TRUE;
-            }
-            prevF = currF;
 
             /* Mode type M (edge-triggered) */
             BOOL currM = (GetAsyncKeyState('M') & 0x8000) != 0;
@@ -1280,29 +1289,18 @@ int main(int argc, char *argv[]) {
             }
             prevM = currM;
 
-            /* Color mode V (edge-triggered) */
-            BOOL currV = (GetAsyncKeyState('V') & 0x8000) != 0;
-            if (currV && !prevV) {
-                g_viz.colorMode = (g_viz.colorMode + 1) % NUM_COLOR_MODES;
-                needUpdate = TRUE;
-            }
-            prevV = currV;
-
             /* Reset SPACE (edge-triggered) */
             BOOL currSpace = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
             if (currSpace && !prevSpace) {
                 VizResetDefaults(&g_viz);
-                g_shell.kappa = 5.0f;
-                g_shell.tauAttack = 0.040f;
-                g_shell.tauRelease = 0.300f;
-                AudioSetFFTSize(&g_audio, DEFAULT_FFT_SIZE);
+                g_cqt.kappa = DEFAULT_KAPPA;
+                g_cqt.tauAttack = DEFAULT_TAU_ATTACK;
+                g_cqt.tauRelease = DEFAULT_TAU_RELEASE;
                 needUpdate = TRUE;
             }
             prevSpace = currSpace;
         } else {
-            prevF = FALSE;
             prevM = FALSE;
-            prevV = FALSE;
             prevSpace = FALSE;
             prevAltEnter = FALSE;
         }
@@ -1324,15 +1322,14 @@ int main(int argc, char *argv[]) {
 
         /* Render */
         if (g_hdc && wglGetCurrentContext()) {
-            float *spectrum = AudioGetData(&g_audio);
-            if (spectrum) {
-                int nBins = g_audio.fftSize / 2 + 1;
-                ShellProcess(&g_shell, spectrum, nBins, g_audio.fftSize);
-                VizRender(&g_viz, &g_shell, dt);
+            float *cqtSpectrum = AudioGetCQT(&g_audio);
+            if (cqtSpectrum) {
+                CQTProcessorProcess(&g_cqt, cqtSpectrum);
+                VizRender(&g_viz, &g_cqt, dt);
                 SwapBuffers(g_hdc);
 
                 if (needUpdate) {
-                    PrintStatus(&g_viz, &g_shell, g_audio.fftSize);
+                    PrintStatus(&g_viz, &g_cqt);
                 }
             }
         } else {
@@ -1347,4 +1344,3 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
-
